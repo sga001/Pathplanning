@@ -77,6 +77,46 @@ python arena/arena.py arena/arena_v1.yaml --render    # visible smoke loop (use 
 
 Phase 2 will plug `DynamicObstacle` / `TrafficSpawner` behind `Arena.initial_dynamic_snapshot` and consume the already-plumbed `traffic_rng` / `motion_rng` from `__init__`. Do not add dynamic obstacle code to Phase 0.
 
+## The episode runner (Phase 1)
+
+`runners/run_episode.py` is the harness entry point that wires a planner to the Arena and records per-episode metrics and a step-by-step trace.
+
+**Run command:**
+```powershell
+.venv\Scripts\Activate.ps1
+python -m runners.run_episode --algorithm a_star_once --seed 42 --world arena/arena_v1.yaml
+```
+
+Optional flags: `--render` (opens the irsim render window) and `--results-dir <dir>` (overrides the default `results/` output directory).
+
+**Results layout:**
+- `results/<algorithm>/<seed>.json` — per-episode metrics (one JSON object).
+- `results/<algorithm>/<seed>.trace.jsonl` — per-step trace (one JSON object per line, keys sorted); written only if planning succeeded (i.e., `planner_error` is null).
+- `results/` is gitignored except for `.gitkeep`.
+
+**Metrics JSON schema** (7 fields — extends Mission.md Phase 1's original 6-field list by adding `planner_error`):
+- `time_to_goal: float | null` — sim seconds to reach goal on success; null on crash, timeout, or planner error.
+- `crashed: bool` — irsim collision flag.
+- `timed_out: bool` — sim_time >= 120.0 without reaching goal.
+- `path_length: float` — Σ ‖state[t+1][:2] − state[t][:2]‖ over the executed trajectory.
+- `mean_speed: float` — path_length / sim_time.
+- `wallclock_per_step: float` — mean of `EpisodeInfo.wallclock_per_step` across all steps; NOT byte-deterministic across real-time runs (perf_counter mean).
+- `planner_error: str | null` — exception message if `plan()` raised, else null.
+
+**Trace JSONL schema** (one JSON object per line, keys sorted):
+- `step: int`, `state: [x, y, θ]`, `action: [v, ω]`, `lidar_sha256: str` (SHA256 hex of `lidar.tobytes()`), `crashed: bool`, `reached_goal: bool`, `done: bool`.
+- Step 0 records the post-reset state with `action=[0.0, 0.0]` as a sentinel; subsequent steps record state AFTER each `arena.step(action)`.
+
+**Determinism guarantee:** same seed → byte-identical `<seed>.trace.jsonl` files across runs. Metrics JSON is equal in every field EXCEPT `wallclock_per_step`, which is a `perf_counter` mean and cannot be byte-identical across two real-time runs.
+
+**TC13–TC16** (added to `python arena/arena.py arena/arena_v1.yaml --check`):
+- TC13: scripted wall-crash via teleport — proves irsim's `collision_flag` fires on a rectangle wall.
+- TC14: full A* drive through the runner (subprocess) + trace-line schema audit — verifies all 7 trace fields are present and typed correctly.
+- TC15: byte-identical trace JSONL across two seeded subprocess runs — verifies the determinism guarantee end-to-end.
+- TC16: planner-failure path on `arena/arena_no_path.yaml` — verifies that a sealed-box world causes A* to raise and that `planner_error` is populated and `trace.jsonl` is not written.
+
+**`arena/arena_no_path.yaml` fixture:** A Phase-1-only Arena-compatible world where the goal is sealed off so A* cannot find a path (used exclusively by TC16). The legacy `tests/no_path.yaml` cannot substitute here because it lacks the `lidar2d` sensor block that `Arena.__init__` requires.
+
 ## Conventions worth preserving
 
 - `manual_astar.py` is written in a strict, dataclass-heavy style (frozen dataclasses, exhaustive `raise ValueError`s on bad input, type hints everywhere, no magic numbers in function bodies). New planner code in this file should match that style; the other scripts are deliberately looser.

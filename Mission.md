@@ -65,7 +65,7 @@ obstacles yet) and confirm:
 - irsim's goal detection fires when we reach `(48, 48)`.
 - Per-episode metrics get logged to `results/<algorithm>/<seed>.json`:
   `{ time_to_goal, crashed, timed_out, path_length, mean_speed,
-  wallclock_per_step }`.
+  wallclock_per_step, planner_error }`.
 - Same seed → byte-identical trace.
 
 ---
