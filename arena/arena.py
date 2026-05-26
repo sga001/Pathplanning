@@ -529,6 +529,39 @@ def tc12(yaml_path: str, seed: int) -> None:  # noqa: ARG001
             pass
 
 
+TC13_MAX_STEPS = 100
+
+
+def tc13(yaml_path: str, seed: int) -> None:
+    """Teleport robot under Wall B, drive forward, and assert crash within budget."""
+    arena = Arena(yaml_path, seed)
+    try:
+        arena.reset()
+
+        new_state = np.array([[20.0], [19.0], [np.pi / 2]], dtype=float)
+        try:
+            arena._robot.state = new_state
+        except (AttributeError, TypeError):
+            arena._robot._state = new_state
+
+        arena._robot.collision_flag = False
+        arena._robot.arrive_flag = False
+
+        action = np.array([[1.0], [0.0]], dtype=float)
+        done = False
+        info: EpisodeInfo | None = None
+        for _ in range(TC13_MAX_STEPS):
+            _, _, done, info = arena.step(action)
+            if done and info.crashed:
+                break
+
+        assert done and info is not None and info.crashed, (
+            f"TC13 did not crash within {TC13_MAX_STEPS} steps; final info={info}"
+        )
+    finally:
+        arena.close()
+
+
 # ---------------------------------------------------------------------------
 # CLI runner — --check (default) or --render. See module docstring above.
 # ---------------------------------------------------------------------------
@@ -549,6 +582,7 @@ def _run_checks(yaml_path: str, seed: int) -> int:
         ("TC10: manual_astar inflation check", tc10),
         ("TC11: YAML schema fields", tc11),
         ("TC12: lidar beam mismatch raises ArenaConfigError", tc12),
+        ("TC13: wall crash via teleport", tc13),
     ]
     failures = 0
     for label, fn in cases:
