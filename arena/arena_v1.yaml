@@ -1,0 +1,55 @@
+world:
+  height: 50
+  width: 50
+
+robot:
+  kinematics: {name: 'diff'}
+  shape: {name: 'circle', radius: 0.2}
+  state: [2, 2, 0]
+  goal:  [48, 48, 0]
+  color: 'g'
+  sensors:
+    - name: 'lidar2d'
+      range_min: 0.05
+      range_max: 10.0
+      angle_range: 6.283185307179586   # 2*pi
+      number: 360
+      alpha: 0.2                       # opacity; if T0 finds alpha invalid in irsim parser, the orchestrator will strip this later
+  plot:
+    show_trajectory: True
+    show_goal: True
+
+obstacle:
+  # Wall A — long horizontal, upper. Spans x in [5, 35] at y ~ 30.
+  - shape: {name: 'rectangle', length: 30, width: 0.8}
+    state: [20, 30, 0]
+
+  # Wall B — long horizontal, lower. Spans x in [15, 45] at y ~ 20.
+  - shape: {name: 'rectangle', length: 30, width: 0.8}
+    state: [30, 20, 0]
+
+  # 12 pillars (r = 0.6 m).
+  - shape: {name: 'circle', radius: 0.6}
+    state: [ 5,  5, 0]
+  - shape: {name: 'circle', radius: 0.6}
+    state: [12,  8, 0]
+  - shape: {name: 'circle', radius: 0.6}
+    state: [35,  5, 0]
+  - shape: {name: 'circle', radius: 0.6}
+    state: [45,  8, 0]
+  - shape: {name: 'circle', radius: 0.6}
+    state: [ 8, 25, 0]
+  - shape: {name: 'circle', radius: 0.6}
+    state: [25, 25, 0]
+  - shape: {name: 'circle', radius: 0.6}
+    state: [38, 25, 0]
+  - shape: {name: 'circle', radius: 0.6}
+    state: [10, 35, 0]
+  - shape: {name: 'circle', radius: 0.6}
+    state: [ 5, 45, 0]
+  - shape: {name: 'circle', radius: 0.6}
+    state: [30, 42, 0]
+  - shape: {name: 'circle', radius: 0.6}
+    state: [45, 35, 0]
+  - shape: {name: 'circle', radius: 0.6}
+    state: [40, 45, 0]
