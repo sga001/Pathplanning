@@ -708,6 +708,7 @@ def tc14(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses fixed inte
                 yaml_path,
                 "--results-dir",
                 td,
+                "--no-traffic",
             ],
             cwd=str(repo_root),
             capture_output=True,
@@ -719,8 +720,8 @@ def tc14(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses fixed inte
             f"stderr={result.stderr[-500:]}"
         )
 
-        json_path = Path(td) / "a_star_once" / "42.json"
-        jsonl_path = Path(td) / "a_star_once" / "42.trace.jsonl"
+        json_path = Path(td) / "arena_v1" / "a_star_once" / "42.json"
+        jsonl_path = Path(td) / "arena_v1" / "a_star_once" / "42.trace.jsonl"
         assert json_path.exists(), f"TC14: metrics JSON missing at {json_path}"
         assert jsonl_path.exists(), f"TC14: trace JSONL missing at {jsonl_path}"
 
@@ -819,6 +820,7 @@ def tc15(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own in
         "42",
         "--world",
         yaml_path,
+        "--no-traffic",
     ]
     with tempfile.TemporaryDirectory() as td_a, tempfile.TemporaryDirectory() as td_b:
         for td in (td_a, td_b):
@@ -833,8 +835,8 @@ def tc15(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own in
                 f"TC15 runner exit {r.returncode}; stderr={r.stderr[-400:]}"
             )
 
-        jsonl_a = Path(td_a) / "a_star_once" / "42.trace.jsonl"
-        jsonl_b = Path(td_b) / "a_star_once" / "42.trace.jsonl"
+        jsonl_a = Path(td_a) / "arena_v1" / "a_star_once" / "42.trace.jsonl"
+        jsonl_b = Path(td_b) / "arena_v1" / "a_star_once" / "42.trace.jsonl"
         assert jsonl_a.exists() and jsonl_b.exists(), (
             f"TC15 trace JSONLs missing: a_exists={jsonl_a.exists()}, "
             f"b_exists={jsonl_b.exists()}"
@@ -845,10 +847,10 @@ def tc15(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own in
         )
 
         json_a = json.loads(
-            (Path(td_a) / "a_star_once" / "42.json").read_text(encoding="utf-8")
+            (Path(td_a) / "arena_v1" / "a_star_once" / "42.json").read_text(encoding="utf-8")
         )
         json_b = json.loads(
-            (Path(td_b) / "a_star_once" / "42.json").read_text(encoding="utf-8")
+            (Path(td_b) / "arena_v1" / "a_star_once" / "42.json").read_text(encoding="utf-8")
         )
         json_a.pop("wallclock_per_step", None)
         json_b.pop("wallclock_per_step", None)
@@ -876,6 +878,7 @@ def tc16(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own in
                 no_path_yaml,
                 "--results-dir",
                 td,
+                "--no-traffic",
             ],
             cwd=str(repo_root),
             capture_output=True,
@@ -886,8 +889,8 @@ def tc16(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own in
             f"TC16 runner exit {r.returncode}; stderr={r.stderr[-400:]}"
         )
 
-        json_path = Path(td) / "a_star_once" / "0.json"
-        jsonl_path = Path(td) / "a_star_once" / "0.trace.jsonl"
+        json_path = Path(td) / "arena_no_path" / "a_star_once" / "0.json"
+        jsonl_path = Path(td) / "arena_no_path" / "a_star_once" / "0.trace.jsonl"
         assert json_path.exists(), f"TC16 metrics JSON missing at {json_path}"
         assert not jsonl_path.exists(), (
             f"TC16 trace JSONL must NOT exist on planner failure; found {jsonl_path}"
@@ -905,6 +908,281 @@ def tc16(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own in
         )
         assert metrics["crashed"] is False, f"TC16 crashed flag: {metrics}"
         assert metrics["timed_out"] is False, f"TC16 timed_out flag: {metrics}"
+
+
+# ---------------------------------------------------------------------------
+# TC17..TC23 — Phase 2 traffic checks (TC17..TC21) + path partitioning (TC22)
+# + import-cycle guard (TC23). All use arena/arena_v1.yaml unless noted.
+# ---------------------------------------------------------------------------
+
+
+def tc17(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own seed (0) for determinism
+    """Init population: 20 obstacles on perimeter edges with inward headings."""
+    from arena.dynamic import DynamicObstacleState, TARGET_POPULATION, OBSTACLE_RADIUS
+
+    arena = Arena(yaml_path, seed=0, traffic=True)
+    try:
+        _, _, info = arena.reset()
+        assert info.dynamic_obstacle_count == TARGET_POPULATION, (
+            f"TC17: dynamic_obstacle_count must be {TARGET_POPULATION}, got {info.dynamic_obstacle_count}"
+        )
+        snapshot = arena.initial_dynamic_snapshot
+        assert len(snapshot) == TARGET_POPULATION, (
+            f"TC17: snapshot length must be {TARGET_POPULATION}, got {len(snapshot)}"
+        )
+        # Per-obstacle invariants
+        # Read the world dims from the YAML so the perimeter check tracks any future arena size change.
+        import yaml as _yaml
+        with open(yaml_path, "r", encoding="utf-8") as fh:
+            world_data = _yaml.safe_load(fh)
+        W = float(world_data["world"]["width"])
+        H = float(world_data["world"]["height"])
+
+        tol = 1e-6
+        for i, obs in enumerate(snapshot):
+            assert isinstance(obs, DynamicObstacleState), (
+                f"TC17: snapshot[{i}] is {type(obs).__name__}, expected DynamicObstacleState"
+            )
+            assert obs.radius == OBSTACLE_RADIUS, (
+                f"TC17: snapshot[{i}].radius must be {OBSTACLE_RADIUS}, got {obs.radius}"
+            )
+            # Perimeter check: must lie on one of the four edges within tol.
+            on_south = abs(obs.y - 0.0) < tol
+            on_north = abs(obs.y - H) < tol
+            on_west  = abs(obs.x - 0.0) < tol
+            on_east  = abs(obs.x - W) < tol
+            assert on_south or on_north or on_west or on_east, (
+                f"TC17: snapshot[{i}] at ({obs.x}, {obs.y}) is not on a perimeter edge "
+                f"(W={W}, H={H}, tol={tol})"
+            )
+            # Inward-heading check: velocity must point AWAY from the boundary it's on.
+            if on_south:
+                assert obs.vy > 0.0, f"TC17: south-edge snapshot[{i}] must have vy>0, got vy={obs.vy}"
+            if on_north:
+                assert obs.vy < 0.0, f"TC17: north-edge snapshot[{i}] must have vy<0, got vy={obs.vy}"
+            if on_west:
+                assert obs.vx > 0.0, f"TC17: west-edge snapshot[{i}] must have vx>0, got vx={obs.vx}"
+            if on_east:
+                assert obs.vx < 0.0, f"TC17: east-edge snapshot[{i}] must have vx<0, got vx={obs.vx}"
+            # Speed in [0.3, 1.5] m/s (factors of MAX_LINEAR_SPEED=1.0).
+            speed = (obs.vx**2 + obs.vy**2) ** 0.5
+            assert 0.3 - tol <= speed <= 1.5 + tol, (
+                f"TC17: snapshot[{i}] speed must be in [0.3, 1.5], got {speed}"
+            )
+    finally:
+        arena.close()
+
+
+def tc18(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own seed
+    """Refill maintains population at 20 across a full-traversal window, with at least one despawn."""
+    from arena.dynamic import TARGET_POPULATION
+
+    arena = Arena(yaml_path, seed=1, traffic=True)
+    try:
+        _, _, _ = arena.reset()
+        initial_live_ids = set(arena.initial_dynamic_snapshot[i].id for i in range(TARGET_POPULATION))
+
+        # Run enough ticks for the slowest obstacle (0.3 m/s) to traverse 50 m at dt=0.1:
+        # 50 / 0.3 ≈ 167 ticks, plus 50 margin.
+        max_ticks = int(50.0 / 0.3 / arena._dt) + 50
+        zero = np.array([[0.0], [0.0]], dtype=float)
+        final_live_ids: set[int] = set()
+        for _ in range(max_ticks):
+            _, _, _, info = arena.step(zero)
+            assert info.dynamic_obstacle_count == TARGET_POPULATION, (
+                f"TC18: dynamic_obstacle_count fell to {info.dynamic_obstacle_count} at step {info.step_idx}; "
+                f"refill broken"
+            )
+            if info.crashed or info.timed_out or info.reached_goal:
+                # Done early — should not happen with a stationary robot in arena_v1's
+                # safe (2,2) start, but break cleanly if it does.
+                break
+            final_live_ids = set(obs.id for obs in arena.initial_dynamic_snapshot)
+            # Use spawner snapshot via arena's internal cache for the final-id read.
+            # Better: query the most recent snapshot from info — but info doesn't expose
+            # the snapshot. Falling back to arena._spawner.live_ids (intentional).
+        # Replace the prior reads with a direct live_ids check (final state):
+        assert arena._spawner is not None
+        final_live_ids = set(arena._spawner.live_ids)
+        churned = initial_live_ids.symmetric_difference(final_live_ids)
+        assert len(churned) > 0, (
+            f"TC18: expected at least one despawn over {max_ticks} ticks, but the live-id set "
+            f"is unchanged ({len(initial_live_ids)} ids). Despawn path may be broken."
+        )
+    finally:
+        arena.close()
+
+
+def tc19(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own seed
+    """Robot-vs-dynamic-obstacle collision fires info.crashed via _inject_for_test."""
+    arena = Arena(yaml_path, seed=2, traffic=True)
+    try:
+        _, _, _ = arena.reset()
+        assert arena._spawner is not None, "TC19: spawner must be live with traffic=True"
+        # Inject an obstacle 1.0 m east of (2,2), moving west at 1.0 m/s.
+        # Collision contact distance = robot_radius (0.2) + obstacle_radius (0.3) = 0.5 m.
+        # Obstacle reaches contact distance after moving 0.5 m → 5 ticks at dt=0.1.
+        arena._spawner._inject_for_test(x=3.0, y=2.0, vx=-1.0, vy=0.0)
+        zero = np.array([[0.0], [0.0]], dtype=float)
+        crashed = False
+        for _ in range(20):
+            _, _, _, info = arena.step(zero)
+            if info.crashed:
+                crashed = True
+                break
+        assert crashed, (
+            "TC19: robot did not crash within 20 ticks of an obstacle traveling toward it at 1 m/s "
+            "from 1 m east — irsim collision detection on dynamic obstacles may be broken"
+        )
+    finally:
+        arena.close()
+
+
+def tc20(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own seed
+    """Traffic determinism: two same-seed arenas produce identical dynamic_obstacles_sha256 sequences."""
+    seed_value = 3
+    n_ticks = 200
+    zero = np.array([[0.0], [0.0]], dtype=float)
+
+    def collect_hashes() -> list[str]:
+        arena = Arena(yaml_path, seed=seed_value, traffic=True)
+        try:
+            _, _, info0 = arena.reset()
+            hashes: list[str] = []
+            assert info0.dynamic_obstacles_sha256 is not None, (
+                "TC20: reset() must produce a non-None dynamic_obstacles_sha256 when traffic=True"
+            )
+            hashes.append(info0.dynamic_obstacles_sha256)
+            for _ in range(n_ticks):
+                _, _, _, info = arena.step(zero)
+                assert info.dynamic_obstacles_sha256 is not None, (
+                    f"TC20: step {info.step_idx} sha256 is None with traffic=True"
+                )
+                hashes.append(info.dynamic_obstacles_sha256)
+                if info.crashed or info.timed_out or info.reached_goal:
+                    break
+            return hashes
+        finally:
+            arena.close()
+
+    hashes_a = collect_hashes()
+    hashes_b = collect_hashes()
+    assert hashes_a == hashes_b, (
+        f"TC20: dynamic_obstacles_sha256 sequences differ between two same-seed runs. "
+        f"len_a={len(hashes_a)}, len_b={len(hashes_b)}. First mismatch at tick "
+        f"{next((i for i, (a, b) in enumerate(zip(hashes_a, hashes_b)) if a != b), 'n/a')}"
+    )
+
+
+def tc21(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own seed
+    """Snapshot shape, type, and immutability."""
+    import dataclasses as _dc
+    from arena.dynamic import DynamicObstacleState, OBSTACLE_RADIUS, TARGET_POPULATION
+
+    # traffic=False, pre-reset: ()
+    arena_off = Arena(yaml_path, seed=5, traffic=False)
+    try:
+        assert arena_off.initial_dynamic_snapshot == (), (
+            f"TC21: traffic=False, pre-reset snapshot must be (), got {arena_off.initial_dynamic_snapshot}"
+        )
+        # traffic=False, post-reset: still ()
+        arena_off.reset()
+        assert arena_off.initial_dynamic_snapshot == (), (
+            f"TC21: traffic=False, post-reset snapshot must be (), got {arena_off.initial_dynamic_snapshot}"
+        )
+    finally:
+        arena_off.close()
+
+    # traffic=True
+    arena_on = Arena(yaml_path, seed=5, traffic=True)
+    try:
+        # Pre-reset: ()
+        assert arena_on.initial_dynamic_snapshot == (), (
+            f"TC21: traffic=True, pre-reset snapshot must be (), got len={len(arena_on.initial_dynamic_snapshot)}"
+        )
+        # Post-reset: 20 frozen entries
+        arena_on.reset()
+        snap = arena_on.initial_dynamic_snapshot
+        assert isinstance(snap, tuple), f"TC21: snapshot must be tuple, got {type(snap).__name__}"
+        assert len(snap) == TARGET_POPULATION, f"TC21: snapshot len must be {TARGET_POPULATION}, got {len(snap)}"
+        first = snap[0]
+        assert _dc.is_dataclass(first), f"TC21: snapshot[0] must be a dataclass, got {type(first).__name__}"
+        assert first.radius == OBSTACLE_RADIUS, (
+            f"TC21: snapshot[0].radius must be {OBSTACLE_RADIUS}, got {first.radius}"
+        )
+        # Frozen: attempting to mutate must raise FrozenInstanceError
+        try:
+            first.x = 999.0  # type: ignore[misc]
+        except _dc.FrozenInstanceError:
+            pass
+        else:
+            raise AssertionError("TC21: DynamicObstacleState must be frozen; field assignment did not raise")
+    finally:
+        arena_on.close()
+
+
+def tc22(yaml_path: str, seed: int) -> None:  # noqa: ARG001
+    """World-stem partitioning: same seed, two different worlds, two distinct result files."""
+    repo_root = Path(__file__).resolve().parent.parent
+    v1_yaml = str(repo_root / "arena" / "arena_v1.yaml")
+    v2_yaml = str(repo_root / "arena" / "arena_v2_hard.yaml")
+    common = [
+        sys.executable, "-m", "runners.run_episode",
+        "--algorithm", "a_star_once",
+        "--seed", "42",
+        "--no-traffic",  # so A* succeeds on both worlds
+    ]
+    with tempfile.TemporaryDirectory() as td:
+        for world in (v1_yaml, v2_yaml):
+            r = subprocess.run(
+                [*common, "--world", world, "--results-dir", td],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            assert r.returncode == 0, (
+                f"TC22 runner failed on {world}: exit={r.returncode}; stderr={r.stderr[-400:]}"
+            )
+
+        json_v1 = Path(td) / "arena_v1" / "a_star_once" / "42.json"
+        json_v2 = Path(td) / "arena_v2_hard" / "a_star_once" / "42.json"
+        jsonl_v1 = Path(td) / "arena_v1" / "a_star_once" / "42.trace.jsonl"
+        jsonl_v2 = Path(td) / "arena_v2_hard" / "a_star_once" / "42.trace.jsonl"
+
+        for p in (json_v1, json_v2, jsonl_v1, jsonl_v2):
+            assert p.exists(), f"TC22: expected output missing at {p}"
+
+        data_v1 = json.loads(json_v1.read_text(encoding="utf-8"))
+        data_v2 = json.loads(json_v2.read_text(encoding="utf-8"))
+        # Different worlds at the same seed must produce different runs.
+        # The simplest non-trivial check: at least one of (path_length, time_to_goal) differs.
+        differs = (
+            data_v1.get("path_length") != data_v2.get("path_length")
+            or data_v1.get("time_to_goal") != data_v2.get("time_to_goal")
+        )
+        assert differs, (
+            f"TC22: arena_v1 and arena_v2_hard at seed=42 produced identical metrics; "
+            f"world-stem partitioning is silently clobbering. v1={data_v1}, v2={data_v2}"
+        )
+
+
+def tc23(yaml_path: str, seed: int) -> None:  # noqa: ARG001
+    """Import-cycle guard: both import orders succeed in a clean subprocess."""
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    for order in ("import planners; import arena.arena",
+                  "import arena.arena; import planners"):
+        r = subprocess.run(
+            [sys.executable, "-c", order],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert r.returncode == 0, (
+            f"TC23: import order failed (`{order}`): exit={r.returncode}; "
+            f"stderr={r.stderr[-400:]}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -931,6 +1209,13 @@ def _run_checks(yaml_path: str, seed: int) -> int:
         ("TC14: full A* drive via runner", tc14),
         ("TC15: determinism — same seed -> byte-identical trace", tc15),
         ("TC16: planner failure on arena_no_path.yaml", tc16),
+        ("TC17: init population (20 on edges, inward)", tc17),
+        ("TC18: refill maintained across full-traversal window", tc18),
+        ("TC19: robot-vs-dynamic-obstacle collision via _inject_for_test", tc19),
+        ("TC20: traffic determinism — sha256 sequences match", tc20),
+        ("TC21: snapshot shape, type, immutability", tc21),
+        ("TC22: world-stem partitioning end-to-end", tc22),
+        ("TC23: import-cycle guard (planners <-> arena.arena)", tc23),
     ]
     failures = 0
     for label, fn in cases:
