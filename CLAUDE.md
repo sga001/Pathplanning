@@ -90,8 +90,9 @@ python -m runners.run_episode --algorithm a_star_once --seed 42 --world arena/ar
 Optional flags: `--render` (opens the irsim render window) and `--results-dir <dir>` (overrides the default `results/` output directory).
 
 **Results layout:**
-- `results/<algorithm>/<seed>.json` — per-episode metrics (one JSON object).
-- `results/<algorithm>/<seed>.trace.jsonl` — per-step trace (one JSON object per line, keys sorted); written only if planning succeeded (i.e., `planner_error` is null).
+- `results/<world_stem>/<algorithm>/<seed>.json` — per-episode metrics (one JSON object).
+- `results/<world_stem>/<algorithm>/<seed>.trace.jsonl` — per-step trace (one JSON object per line, keys sorted); written only if planning succeeded (i.e., `planner_error` is null).
+- `<world_stem> = Path(args.world).stem` (so `arena/arena_v1.yaml` → `arena_v1/`); prevents same-seed runs against different YAMLs from clobbering each other.
 - `results/` is gitignored except for `.gitkeep`.
 
 **Metrics JSON schema** (7 fields — extends Mission.md Phase 1's original 6-field list by adding `planner_error`):
@@ -116,6 +117,40 @@ Optional flags: `--render` (opens the irsim render window) and `--results-dir <d
 - TC16: planner-failure path on `arena/arena_no_path.yaml` — verifies that a sealed-box world causes A* to raise and that `planner_error` is populated and `trace.jsonl` is not written.
 
 **`arena/arena_no_path.yaml` fixture:** A Phase-1-only Arena-compatible world where the goal is sealed off so A* cannot find a path (used exclusively by TC16). The legacy `tests/no_path.yaml` cannot substitute here because it lacks the `lidar2d` sensor block that `Arena.__init__` requires.
+
+## The traffic harness (Phase 2)
+
+`arena/dynamic.py` adds Mission.md's crossing-traffic substrate. `Arena(..., traffic=True)` instantiates a `TrafficSpawner` that maintains a ~20-obstacle population of straight-line, edge-spawned, uniformly-on-perimeter-distributed dynamic obstacles. Each obstacle is a circle (r=0.3 m) registered into irsim via `env.create_obstacle({'name':'omni'}, ...) + env.add_object`, so lidar and `robot.collision_flag` see them natively — no custom collision code.
+
+**API:**
+- `Arena(yaml, seed, traffic=True, ...)` — opt-in flag; default `False` for Phase 0/1 compatibility.
+- `arena.initial_dynamic_snapshot` — returns `tuple[DynamicObstacleState, ...]` (length 20 after `reset()` when `traffic=True`; `()` pre-reset or when `traffic=False`). `DynamicObstacleState` is a frozen dataclass with fields `(id, x, y, vx, vy, radius)`.
+- `EpisodeInfo.dynamic_obstacles_sha256: str | None` — per-tick deterministic hash of the sorted-by-id obstacle state matrix. Used by the determinism TCs.
+- `EpisodeInfo.dynamic_obstacle_count: int` — population each tick (Phase 0/1: always 0; Phase 2: 20).
+
+**Determinism guarantees:**
+- `traffic_rng` (derived from master seed via `SeedSequence.spawn(2)`) draws in a fixed order per spawn attempt: perimeter position → heading → speed; ALL THREE re-drawn on overlap rejection.
+- `motion_rng` is plumbed but never drawn from in Phase 2 (forward-compat for Phase 2b motion noise).
+- Two `Arena(seed=K, traffic=True)` instances produce byte-identical `dynamic_obstacles_sha256` sequences over identical action streams.
+
+**Runner default:**
+- `python -m runners.run_episode --algorithm a_star_once --seed 42 --world arena/arena_v1.yaml` — traffic ON by default. A* `_once` planners do not dodge, so most seeds end in collision; that is the experimental signal Mission.md's scatter plot consumes.
+- Pass `--no-traffic` to reproduce Phase 1's deterministic A* success path; the trace JSONL stays 7 keys per line.
+- With traffic on, the trace JSONL gains an 8th key `dynamic_obstacles_sha256` per step (step-0 line uses the reset-time hash; subsequent lines use the post-step hash).
+
+**Results layout:**
+- `results/<world_stem>/<algorithm>/<seed>.{json,trace.jsonl}` — runner output. World-stem partitioning means same-seed runs on `arena_v1.yaml` and `arena_v2_hard.yaml` do not overwrite each other.
+
+**TC17–TC23** (added to `python arena/arena.py arena/arena_v1.yaml --check`):
+- TC17: init population of 20, every spawn on a perimeter edge with inward heading.
+- TC18: refill maintains population at 20 across a full-traversal window (verifies the despawn/respawn cycle).
+- TC19: robot-vs-dynamic-obstacle collision fires `info.crashed` via `_inject_for_test`.
+- TC20: two same-seed runs produce identical `dynamic_obstacles_sha256` sequences (per-tick).
+- TC21: `initial_dynamic_snapshot` is a tuple of frozen `DynamicObstacleState` of length 20; mutation raises `FrozenInstanceError`.
+- TC22: world-stem partitioning — same seed against two different YAMLs produces two distinct result files; neither clobbers the other.
+- TC23: subprocess import-cycle guard — `import planners; import arena.arena` and the reverse both exit 0.
+
+`arena/arena_v2_hard.yaml` is a second 50×50 world (same robot start/goal/lidar as arena_v1, but walls relocated) used by TC22 to cross-check the partitioning. It otherwise has no special semantics in Phase 2.
 
 ## Conventions worth preserving
 
