@@ -11,7 +11,7 @@ robot:
   sensors:
     - name: 'lidar2d'
       range_min: 0.05
-      range_max: 10.0
+      range_max: 5.0
       angle_range: 6.283185               # just under 2*pi; irsim's WrapTo2Pi collapses exactly 2*pi to 0
       number: 360
       alpha: 0.2                       # opacity; if T0 finds alpha invalid in irsim parser, the orchestrator will strip this later
