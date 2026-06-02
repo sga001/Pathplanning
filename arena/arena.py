@@ -82,7 +82,10 @@ class Arena:
         self._env = irsim.make(str(self._yaml_path), display=self._render)
         self._robot = self._env.robot_list[0]
         self._dt = float(self._env.step_time)
-        self._goal_xy = self._robot.goal[:2, 0].astype(np.float64)
+        goal = self._robot.goal
+        if goal is None:
+            raise ArenaConfigError("YAML robot has no goal pose")
+        self._goal_xy = goal[:2, 0].astype(np.float64)
 
         scan = self._robot.get_lidar_scan()
         if not scan:
@@ -662,11 +665,8 @@ def tc13(yaml_path: str, seed: int) -> None:
     try:
         arena.reset()
 
-        new_state = np.array([[20.0], [19.0], [np.pi / 2]], dtype=float)
-        try:
-            arena._robot.state = new_state
-        except (AttributeError, TypeError):
-            arena._robot._state = new_state
+        # ObjectBase.state is read-only; set_state also refreshes geometry for collision checks.
+        arena._robot.set_state([20.0, 19.0, np.pi / 2], init=False)
 
         arena._robot.collision_flag = False
         arena._robot.arrive_flag = False
