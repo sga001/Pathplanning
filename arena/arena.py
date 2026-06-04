@@ -79,7 +79,15 @@ class Arena:
         self._master_seed = int(seed)
         self._traffic = bool(traffic)
 
-        self._env = irsim.make(str(self._yaml_path), display=self._render)
+        # With traffic on, every dynamic obstacle (omni, no behavior) makes irsim log
+        # a per-tick WARNING ("Behavior not defined ..."), ~20 lines/tick that would
+        # flood the runner output. Raise the irsim log level to ERROR for traffic runs
+        # (collision/arrival are read from flags, not these logs); Phase 0/1 runs keep
+        # the default level so their logging is unchanged.
+        log_level = "ERROR" if self._traffic else "INFO"
+        self._env = irsim.make(
+            str(self._yaml_path), display=self._render, log_level=log_level
+        )
         self._robot = self._env.robot_list[0]
         self._dt = float(self._env.step_time)
         goal = self._robot.goal
@@ -143,6 +151,7 @@ class Arena:
         self._step_idx = 0
         self._done = False
         self._closed = False
+        self._reset_called = False
 
     def reset(self) -> tuple[np.ndarray, np.ndarray, EpisodeInfo]:
         if self._closed:
@@ -158,29 +167,13 @@ class Arena:
         self._traffic_rng = np.random.default_rng(traffic_seed)
         self._motion_rng = np.random.default_rng(motion_seed)
 
-        # Step 3: delete dynamically-spawned obstacles from the PRIOR episode.
-        # env.reset() resets their POSE but does not remove them; calling
-        # spawner.initialize() now without delete-first would DOUBLE the population.
+        # Step 3: clear the PRIOR episode's dynamic obstacles. env.reset() resets their
+        # POSE but does not remove them; spawning again without clearing would DOUBLE
+        # the population. The spawner owns its own teardown (delete-all + RNG rebind) —
+        # the cached point-distance callable and static-obstacle list are preserved,
+        # and its _next_idx keeps climbing so obstacle names never collide.
         if self._spawner is not None:
-            for prior_id in self._spawner.live_ids:
-                try:
-                    self._env.delete_object(prior_id)
-                except (KeyError, ValueError, AttributeError):
-                    # id may already be absent if env.reset() raced; rebuild below
-                    pass
-            # Rebuild the spawner so the freshly-derived RNGs propagate (spawner stores
-            # rngs by reference). Cheaper than threading a spawner.reset() method through.
-            assert self._world_model is not None  # invariant: world_model is set iff traffic
-            self._spawner = TrafficSpawner(
-                env=self._env,
-                robot=self._robot,
-                traffic_rng=self._traffic_rng,
-                motion_rng=self._motion_rng,
-                dt=self._dt,
-                arena_w=float(self._world_model.width),
-                arena_h=float(self._world_model.height),
-                static_obstacles=self._world_model.obstacles,
-            )
+            self._spawner.reset(self._traffic_rng, self._motion_rng)
 
         # Step 4: spawn fresh population (if traffic enabled). The initial snapshot
         # is pinned here and exposed via the initial_dynamic_snapshot property for the
@@ -188,8 +181,12 @@ class Arena:
         # view planners depend on must never drift.
         if self._spawner is not None:
             self._initial_snapshot = self._spawner.initialize()
+            # env.reset()'s warm-up sensed the lidar BEFORE these obstacles existed, so
+            # re-sense now: lidar0 must be consistent with the snapshot/sha the planner
+            # receives for the same t=0 (reactive planners consume lidar0).
+            self._robot.sensor_step()
             self._last_snapshot = self._initial_snapshot
-            self._last_sha256 = self._spawner.state_sha256()
+            self._last_sha256 = self._spawner.state_sha256(self._last_snapshot)
         else:
             self._initial_snapshot = ()
             self._last_snapshot = ()
@@ -203,6 +200,7 @@ class Arena:
         # Step 6: counter reset
         self._step_idx = 0
         self._done = False
+        self._reset_called = True
 
         # Step 7: build initial state + lidar + EpisodeInfo
         state = self._robot.state[:, 0].astype(np.float64)
@@ -230,6 +228,8 @@ class Arena:
             raise RuntimeError("Episode is done; call reset() first.")
         if self._closed:
             raise RuntimeError("Arena is closed")
+        if not self._reset_called:
+            raise RuntimeError("reset() must be called before step()")
 
         if not isinstance(action, np.ndarray):
             raise ValueError(
@@ -248,7 +248,7 @@ class Arena:
         # samples post-move obstacle positions on the same tick.
         if self._spawner is not None:
             self._last_snapshot = self._spawner.step()
-            self._last_sha256 = self._spawner.state_sha256()
+            self._last_sha256 = self._spawner.state_sha256(self._last_snapshot)
 
         # Snapshot flags BEFORE step: irsim's check_*_status overwrite them per tick
         # (see object_base.py:531-532), so harness-injected flags would be lost otherwise.

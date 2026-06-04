@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -32,10 +33,12 @@ TARGET_POPULATION = 20
 OBSTACLE_RADIUS = 0.3
 SPEED_MIN_FACTOR = 0.3
 SPEED_MAX_FACTOR = 1.5
-ROBOT_TOP_SPEED = 1.0  # CONTRACT: must equal manual_astar.MAX_LINEAR_SPEED — kept duplicated to avoid an import dependency at module-load time.
 SPAWN_OVERLAP_BUFFER = 1.0
 DESPAWN_BUFFER = 0.5
-SPAWN_MAX_ATTEMPTS = 20
+# Generous attempt budget: a spawn almost always succeeds in 1-2 tries, so a high
+# cap makes a silent short-population (the TC18 invariant) effectively impossible
+# without changing RNG consumption on the common path.
+SPAWN_MAX_ATTEMPTS = 100
 DYNAMIC_OBSTACLE_NAME_FMT = "traffic_{idx}"
 
 
@@ -113,13 +116,40 @@ class TrafficSpawner:
         _repo_root = str(_Path(__file__).resolve().parent.parent)
         if _repo_root not in _sys.path:
             _sys.path.insert(0, _repo_root)
-        from manual_astar import point_to_obstacle_distance  # type: ignore[import-not-found]
+        from manual_astar import (  # type: ignore[import-not-found]
+            MAX_LINEAR_SPEED,
+            point_to_obstacle_distance,
+        )
 
         self._point_to_obstacle_distance = point_to_obstacle_distance
+        # Source the obstacle speed band from the robot's actual top speed instead of
+        # a hand-copied constant, so the two cannot silently drift apart.
+        self._robot_top_speed = float(MAX_LINEAR_SPEED)
 
     @property
     def live_ids(self) -> frozenset[int]:
         return frozenset(self._live.keys())
+
+    def reset(
+        self,
+        traffic_rng: np.random.Generator,
+        motion_rng: np.random.Generator,
+    ) -> None:
+        """Clear all live obstacles and rebind the RNGs for a new episode WITHOUT
+        rebuilding the spawner: the cached point-distance callable, static-obstacle
+        list, and cached robot start stay put (env.reset() restores the same robot
+        pose). _next_idx is intentionally NOT reset, so obstacle names never collide
+        across the Arena's lifetime even after delete + respawn."""
+        if self._closed:
+            raise ArenaRuntimeError("TrafficSpawner.reset() called after close()")
+        for obs_id in list(self._live.keys()):
+            try:
+                self._env.delete_object(obs_id)
+            except (KeyError, ValueError, AttributeError):
+                pass
+        self._live = {}
+        self._traffic_rng = traffic_rng
+        self._motion_rng = motion_rng
 
     def initialize(self) -> tuple[DynamicObstacleState, ...]:
         self._refill()
@@ -147,13 +177,22 @@ class TrafficSpawner:
             )
         return tuple(out)
 
-    def state_sha256(self) -> str:
-        snap = self.snapshot()
+    def state_sha256(
+        self, snap: tuple[DynamicObstacleState, ...] | None = None
+    ) -> str:
+        # Accept an already-built snapshot so callers don't rebuild it (step() and
+        # initialize() already produced one). Hash physical state only: obstacle id is
+        # an irsim handle that climbs across reset() (id_iter resets per env.make(),
+        # not per env.reset()), so hashing it would make the digest differ across
+        # repeated reset() of one Arena. Row order stays by id via snapshot(), so the
+        # ordering is still deterministic.
+        if snap is None:
+            snap = self.snapshot()
         if not snap:
-            arr = np.empty((0, 6), dtype=np.float64)
+            arr = np.empty((0, 5), dtype=np.float64)
         else:
             arr = np.array(
-                [[float(s.id), s.x, s.y, s.vx, s.vy, s.radius] for s in snap],
+                [[s.x, s.y, s.vx, s.vy, s.radius] for s in snap],
                 dtype=np.float64,
             )
         return hashlib.sha256(arr.tobytes()).hexdigest()
@@ -223,30 +262,44 @@ class TrafficSpawner:
                 to_remove.append(obs_id)
 
         for obs_id in to_remove:
+            # Reconcile our own tracking FIRST so a delete_object failure cannot leave
+            # a phantom id in _live (which snapshot()/state_sha256() would then
+            # over-report relative to what irsim's lidar/collision tree actually sees).
+            del self._live[obs_id]
             try:
                 self._env.delete_object(obs_id)
             except Exception as exc:
                 raise ArenaRuntimeError(
                     f"env.delete_object failed for tracked id {obs_id}: {exc}"
                 ) from exc
-            del self._live[obs_id]
 
     def _refill(self) -> None:
         while len(self._live) < TARGET_POPULATION:
             spawned = self._try_one_spawn()
             if not spawned:
-                # Gave up after SPAWN_MAX_ATTEMPTS draws; next tick retries silently.
+                # Exhausted SPAWN_MAX_ATTEMPTS for this slot. Surface it instead of
+                # silently shipping a short population (the harness/TC18 treat 20 as an
+                # invariant) so an unlucky seed is debuggable. Non-fatal: next tick retries.
+                warnings.warn(
+                    f"TrafficSpawner: refill gave up at {len(self._live)}/"
+                    f"{TARGET_POPULATION} live after {SPAWN_MAX_ATTEMPTS} attempts; "
+                    "population is below target this tick.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
                 return
 
     def _try_one_spawn(self) -> bool:
         for _ in range(SPAWN_MAX_ATTEMPTS):
             # Three RNG draws per attempt, always in this order: position, heading, speed.
-            t = float(self._traffic_rng.uniform(0.0, 4.0 * self._arena_w))
+            t = float(
+                self._traffic_rng.uniform(0.0, 2.0 * (self._arena_w + self._arena_h))
+            )
             x, y, heading_lo, heading_hi = self._perimeter_sample(t)
             heading = float(self._traffic_rng.uniform(heading_lo, heading_hi))
             speed = float(
                 self._traffic_rng.uniform(SPEED_MIN_FACTOR, SPEED_MAX_FACTOR)
-                * ROBOT_TOP_SPEED
+                * self._robot_top_speed
             )
 
             if self._overlaps_robot_start(x, y):
@@ -270,8 +323,10 @@ class TrafficSpawner:
         return False
 
     def _perimeter_sample(self, t: float) -> tuple[float, float, float, float]:
-        """Map t in [0, 4W) onto the arena perimeter and return the inward
-        heading half-cone for that edge. Assumes square arena (W == H per spec)."""
+        """Map t in [0, 2*(W+H)) onto the arena perimeter and return the inward
+        heading half-cone for that edge. Each edge is mapped by its own length
+        (south=W, east=H, north=W, west=H), so this works for any rectangle, not
+        only the square arenas shipped today."""
         W = self._arena_w
         H = self._arena_h
         if t < W:
