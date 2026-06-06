@@ -30,7 +30,7 @@ pathplanning/
 │   ├── _grid.py            #   shared grid substrate + lidar fold + ALGORITHMS registry
 │   ├── a_star.py           #   a_star_once / a_star_replan
 │   ├── dijkstra.py         #   dijkstra_once / dijkstra_replan (A* with a zero heuristic)
-│   └── d_star_lite.py      #   d_star_lite (incremental, forward pointer)
+│   └── d_star_lite.py      #   d_star_lite (incremental; rejects --replan-k)
 ├── runners/                # experiment harness (Phase 1 + 3)
 │   ├── run_episode.py      #   one planner × one seed × one world → metrics + trace
 │   └── run_experiment.py   #   one planner × the canonical 50 seeds → batch + manifest
@@ -273,8 +273,10 @@ controller module calls `register(name, cls)` from `planners/_grid.py` at import
 (see `a_star.py`), and importing the `planners` package populates the registry.
 The runner builds the instance via `build_controller`. Five planners ship today:
 `a_star_once`, `a_star_replan`, `dijkstra_once`, `dijkstra_replan`, and
-`d_star_lite`. The `_replan` families take a required `--replan-k`. Mission.md
-Phase 6 still expects the reactive (DWA, APF) and sampling (RRT, RRT*) families.
+`d_star_lite`. The `_replan` families take a required `--replan-k`; `d_star_lite`
+is the incremental planner (no `_once`/`_replan` split, and it rejects
+`--replan-k`). Mission.md Phase 6 still expects the reactive (DWA, APF) and
+sampling (RRT, RRT*) families.
 
 ---
 
