@@ -1,10 +1,17 @@
 """Single-episode runner — drives a registered planner against an Arena world and writes metrics + trace.
 
+The main loop is planner-agnostic: it drives any `Controller` via `reset()` at
+t=0 and a per-step `act(state, lidar)`. The algorithm registry is sourced from
+`planners` (populated by the controller modules' self-registration at import).
+
 CLI:
     python -m runners.run_episode \
-        --algorithm <name>      # required; e.g. "a_star_once"
+        --algorithm <name>      # required; one of the registered planners
+                                #   (e.g. "a_star_once", "a_star_replan",
+                                #    "dijkstra_once", "dijkstra_replan")
         --seed <int>            # required
         --world <yaml_path>     # required; e.g. arena/arena_v1.yaml
+        [--replan-k <int>]      # required for the _replan family, forbidden otherwise
         [--render]              # optional flag; default False
         [--results-dir <dir>]   # optional; default "results"
         [--traffic|--no-traffic]# optional; Phase 2 crossing traffic, default ON
@@ -15,10 +22,12 @@ Programmatic:
                "--world", "arena/arena_v1.yaml", "--results-dir", "out"])
 
 Outputs:
-    <results-dir>/<world_stem>/<algorithm>/<seed>.json         — 7-field metrics JSON (always written)
-    <results-dir>/<world_stem>/<algorithm>/<seed>.trace.jsonl  — per-step trace (only on planning success)
-    where <world_stem> = Path(args.world).stem (e.g. "arena_v1", "arena_v2_hard", "arena_no_path").
-    World-level partitioning prevents same-seed runs on different worlds from overwriting each other.
+    <results-dir>/<world_stem>/<label>/<seed>.json         — 7-field metrics JSON (always written)
+    <results-dir>/<world_stem>/<label>/<seed>.trace.jsonl  — per-step trace (only on planning success)
+    where <world_stem> = Path(args.world).stem (e.g. "arena_v1", "arena_v2_hard", "arena_no_path")
+    and <label> = algorithm_label(args.algorithm, args.replan_k) (e.g. "a_star_once",
+    "a_star_replan_k5"). World-level partitioning prevents same-seed runs on different
+    worlds from overwriting each other; the label keeps replan cadences from colliding.
 
     Trace-line schema is flag-dependent: 7 keys with --no-traffic (Phase-1 byte-compatible),
     8 keys with traffic on (adds "dynamic_obstacles_sha256"). Consumers must treat that key
@@ -26,7 +35,8 @@ Outputs:
 
 Exit codes:
     0 — episode terminated (success, crash, timeout, or planner failure all return 0)
-    2 — argparse parsing error or Arena __init__ config error (e.g., ArenaConfigError)
+    2 — argparse parsing error, a bad --replan-k (missing/forbidden/out-of-range
+        for the chosen algorithm), or an Arena __init__ config error (e.g., ArenaConfigError)
 """
 from __future__ import annotations
 
@@ -41,26 +51,26 @@ from typing import IO, Any
 
 import numpy as np
 
-# Make repo root importable so `from manual_astar import ...` works when this
-# module is invoked as `python -m runners.run_episode` from any cwd.
+# Make repo root importable so `from planners import ...` / `from arena.arena import ...`
+# resolve when this module is invoked as `python -m runners.run_episode` from any cwd.
 _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from arena.arena import Arena  # noqa: E402
-from manual_astar import (  # noqa: E402
-    WAYPOINT_REACHED_DISTANCE,
-    WaypointFollower,
-    compute_action,
+
+# Importing `planners` populates ALGORITHMS via the controller modules'
+# self-registration at import time (a_star_once / a_star_replan / dijkstra_once
+# / dijkstra_replan). The registry is the single source of truth for the
+# --algorithm choices, so the runner no longer keeps a local copy.
+from planners import (  # noqa: E402
+    ALGORITHMS,
+    Controller,
+    algorithm_label,
+    build_controller,
 )
-from planners import AStarOncePlanner, PathPlanner  # noqa: E402
 from runners._layout import episode_out_dir  # noqa: E402
 
-
-# Algorithm registry. Phase 6 expands this dict with the remaining planners.
-ALGORITHMS: dict[str, type[PathPlanner]] = {
-    "a_star_once": AStarOncePlanner,
-}
 
 # Metrics JSON has exactly these seven keys. Extends Mission.md Phase 1's
 # six-field list with `planner_error` (str | None).
@@ -82,6 +92,7 @@ class RunnerArgs:
     algorithm: str
     seed: int
     world: str
+    replan_k: int | None
     render: bool
     results_dir: str
     traffic: bool
@@ -110,6 +121,15 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
         help="Path to the world YAML (e.g. arena/arena_v1.yaml).",
     )
     parser.add_argument(
+        "--replan-k",
+        type=int,
+        default=None,
+        help=(
+            "Replan cadence for the _replan family (act every k-th step). "
+            "Required for those algorithms, forbidden for the rest."
+        ),
+    )
+    parser.add_argument(
         "--render",
         action="store_true",
         help="Open an irsim render window (default: headless).",
@@ -117,7 +137,7 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
     parser.add_argument(
         "--results-dir",
         default="results",
-        help="Output directory root; results go in <results-dir>/<world_stem>/<algorithm>/.",
+        help="Output directory root; results go in <results-dir>/<world_stem>/<label>/ (label = algorithm, or algorithm_k<K> for replan families).",
     )
     traffic_group = parser.add_mutually_exclusive_group()
     traffic_group.add_argument(
@@ -138,6 +158,7 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
         algorithm=ns.algorithm,
         seed=int(ns.seed),
         world=ns.world,
+        replan_k=None if ns.replan_k is None else int(ns.replan_k),
         render=bool(ns.render),
         results_dir=ns.results_dir,
         traffic=bool(ns.traffic),
@@ -218,8 +239,14 @@ def main(argv: list[str] | None = None) -> int:
     """Run one episode end-to-end. See module docstring for CLI semantics."""
     args = _parse_args(argv)
 
-    planner_cls = ALGORITHMS[args.algorithm]
-    planner = planner_cls()
+    # Build the controller before touching the Arena so a bad --replan-k (missing
+    # for a _replan family, forbidden for a non-replan family, or out of range) is
+    # reported as a config error (exit 2) rather than a planner failure (exit 0).
+    try:
+        controller: Controller = build_controller(args.algorithm, args.replan_k)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     # Arena __init__ may raise ArenaConfigError — let it propagate (exit 2 via
     # the harness convention; the OS surfaces an unhandled exception as nonzero
@@ -228,8 +255,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # World-stem partitioning: same seed against different YAMLs writes to different
     # directories, so a run cannot silently overwrite a previous run on another world.
+    # The label folds the replan cadence in (a_star_replan_k5) so cadences do not
+    # collide; the <seed>.json / <seed>.trace.jsonl filenames are unchanged.
     world_stem = Path(args.world).stem
-    out_dir = episode_out_dir(args.results_dir, world_stem, args.algorithm)
+    out_dir = episode_out_dir(
+        args.results_dir, world_stem, algorithm_label(args.algorithm, args.replan_k)
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = out_dir / f"{args.seed}.json"
     trace_path = out_dir / f"{args.seed}.trace.jsonl"
@@ -255,13 +286,15 @@ def main(argv: list[str] | None = None) -> int:
             dynamic_obstacles_sha256=info0.dynamic_obstacles_sha256,
         )
 
-        # Plan. Only (ValueError, RuntimeError) are caught — these are the
-        # exception classes manual_astar.{validate_start_and_goal,astar_search}
-        # produce. Any other exception (TypeError, AttributeError, ImportError,
-        # ...) is a programmer bug and must surface loudly.
+        # Plan at t=0 via the controller. Only (ValueError, RuntimeError) are
+        # caught — these are the exception classes the controllers' reset()
+        # produces (no path / empty path / blocked goal). An empty path is now
+        # raised as ValueError inside reset(), so the old separate empty-path
+        # branch is gone. Any other exception (TypeError, AttributeError,
+        # ImportError, ...) is a programmer bug and must surface loudly.
         try:
-            waypoints = planner.plan(
-                args.world, arena.initial_dynamic_snapshot, lidar0
+            controller.reset(
+                args.world, arena.initial_dynamic_snapshot, lidar0, state0
             )
         except (ValueError, RuntimeError) as exc:
             # Planner failure: tear down the trace (no trace on planner failure)
@@ -284,29 +317,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
 
-        if not waypoints:
-            # `plan()` returned an empty tuple — treat as planner failure
-            # (no path to follow). Same disposition as the exception branch.
-            trace_file.close()
-            trace_file = None
-            try:
-                trace_path.unlink()
-            except FileNotFoundError:
-                pass
-            _write_metrics(
-                metrics_path,
-                time_to_goal=None,
-                crashed=False,
-                timed_out=False,
-                path_length=0.0,
-                mean_speed=0.0,
-                wallclock_per_step=0.0,
-                planner_error="planner returned an empty waypoint list",
-            )
-            return 0
-
-        # Drive the planned waypoints until Arena reports done.
-        follower = WaypointFollower(list(waypoints), WAYPOINT_REACHED_DISTANCE)
+        # Drive the controller until Arena reports done. `act()` owns the
+        # follower/replan logic and must never raise on a mid-episode replan
+        # failure, so no per-step guard is needed here.
+        state, lidar = state0, lidar0
         path_length = 0.0
         total_wallclock = 0.0
         prev_xy = state0[:2].copy()
@@ -315,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
         info = None
 
         while not done:
-            action = compute_action(arena._robot, follower)
+            action = controller.act(state, lidar)
             state, lidar, done, info = arena.step(action)
             step_count += 1
             path_length += float(np.linalg.norm(state[:2] - prev_xy))
