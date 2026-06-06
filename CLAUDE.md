@@ -69,7 +69,7 @@ When adding a new world, copy an existing one as the template — irsim is stric
 **Smoke and verification:**
 ```powershell
 .venv\Scripts\Activate.ps1
-python arena/arena.py arena/arena_v1.yaml --check     # 28 PASS = harness healthy (TC1-TC27; ~9-10 min, dominated by full-episode subprocess TCs)
+python arena/arena.py arena/arena_v1.yaml --check     # 38 PASS = harness healthy (TC1-TC37; ~30 min, dominated by the D* Lite + a_star_replan full-episode subprocess TCs)
 python arena/arena.py arena/arena_v1.yaml --render    # visible smoke loop (use to eyeball YAML)
 ```
 
@@ -181,6 +181,29 @@ python -m runners.run_experiment --algorithm a_star_once --world arena/arena_v1.
 - TC25: seed derivation — determinism, 64-bit uniqueness, prefix property, master-sensitivity (pure computation).
 - TC26: batch determinism + parallel-ordering — two same-master-seed `--jobs 1` runs produce byte-identical per-seed JSON and manifest; a `--jobs 3` run keeps the manifest in derivation order (completion order must not leak). Uses `arena_no_path.yaml` so each episode fails fast.
 - TC27: failure accounting — a malformed (but existing) world makes every child exit non-zero; the batch reports the failures and itself exits non-zero.
+
+## The planner family (Phase 6)
+
+`planners/` holds the pluggable controllers. Phase 6 shipped the unified interface, the grid family, and D* Lite; the reactive (DWA, APF) and sampling (RRT, RRT*) families and the Phase 6b K-sweep are still deferred.
+
+**The `Controller` interface** (`planners/_types.py`): a `name` attribute (the FAMILY name, e.g. `a_star_replan`), `reset(world_yaml, initial_snapshot, lidar0, state0) -> None` (build the static substrate and the t=0 plan; may raise `ValueError`/`RuntimeError`, which the runner records as `planner_error`), and `act(state, lidar) -> (2,1) action`. `run_episode.py` is now planner-agnostic: it calls `reset()` once at t=0, then `while not done: act()`. A mid-episode replan that fails inside `act()` must not raise (the controller keeps its last valid path), so only a t=0 plan failure yields `planner_error`.
+
+**The registry** (`planners/_grid.py`): controller modules self-register into `ALGORITHMS` at import (via `register(name, cls)`); importing the `planners` package is what populates it. `build_controller(name, replan_k)` validates the pair and constructs the instance; `algorithm_label(name, replan_k)` returns the results-dir label.
+
+**The grid planners shipped**: `a_star_once`, `a_star_replan`, `dijkstra_once`, `dijkstra_replan`. Dijkstra is A* with a zero heuristic (`heuristic_fn = staticmethod(lambda *_: 0.0)`), so it reuses the same `astar_search` and grid machinery — only the heuristic differs. The `_once` controllers plan once on the STATIC occupancy grid (analytic line-of-sight pipeline from `manual_astar`, no lidar fold) and follow that path forever; the `_replan` controllers (`PathFollowingController`) re-search the lidar-folded grid every K acts. `d_star_lite` also ships as the incremental planner with a forward pointer (see D* Lite below); it is not a `_once`/`_replan` family.
+
+**`--replan-k`**: required for the `_replan` families (`a_star_replan`, `dijkstra_replan` — the `REPLAN_FAMILIES` set), rejected for `_once` and `d_star_lite`. Results land in `results/<world_stem>/<family>_k<K>/` (e.g. `a_star_replan_k5/`); `algorithm_label` folds the cadence into the label so different K values do not collide. `run_experiment` forwards `--replan-k` to each child episode and records it in `_manifest.json` as `replan_k`.
+
+**The lidar->grid fold** (`lidar_to_occupancy`): memoryless — it folds the current lidar frame onto a COPY of the static grid each time (no accumulation across replans; the static cells are never mutated). After t=0 the replanners are lidar-only (Mission-faithful: `initial_snapshot` is ignored by design because lidar0 already encodes those obstacles). Beam bearings are recovered as `np.linspace(angle_min, angle_max, number)` from the YAML `lidar2d` sensor block, mirroring how irsim lays the beams. A replan re-searches from the robot's CURRENT cell to the goal; a failed mid-episode replan is swallowed and the last valid path is kept, so only the t=0 plan failing produces `planner_error`.
+
+**TC28–TC34** (added to `python arena/arena.py arena/arena_v1.yaml --check`):
+- TC28: lidar->grid fold geometry — pose-dependent and memoryless (a finite beam blocks its hit cell, far cells stay free, an all-NaN scan reproduces the static grid, and the fold returns a new array without mutating the static cells).
+- TC29: Dijkstra == A* optimal cost, and `dijkstra_once` reaches the goal through the runner.
+- TC30: `a_star_replan` end-to-end (subprocess) — writes to the `a_star_replan_k5` labeled dir and every traffic-on trace line carries the 8-key schema.
+- TC31: replan cadence — `compute_path` fires only on every K-th act, and each fold is memoryless (no obstacle leaks across replans).
+- TC32: mid-replan failure fallback — a replan that raises does not propagate out of `act()`, and the existing follower object is kept (not rebuilt).
+- TC33: `--replan-k` validation — required/forbidden per family, plus `name == registry key`, the `_k<K>` label, and `ALGORITHMS` membership.
+- TC34: `a_star_once` parity through the new planner-agnostic loop — two same-seed `--no-traffic` runs produce byte-identical trace JSONL.
 
 ## Conventions worth preserving
 
