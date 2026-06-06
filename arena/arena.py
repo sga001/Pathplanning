@@ -1292,10 +1292,13 @@ def tc26(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses arena_no_p
     """
     repo_root = Path(__file__).resolve().parent.parent
     world = str(repo_root / "arena" / "arena_no_path.yaml")
+    # Master seed 1 yields a DESCENDING 3-seed prefix, so derivation order differs from
+    # sort-by-seed order — this is what gives the ordering assertion below real teeth.
     base = [
         sys.executable, "-m", "runners.run_experiment",
         "--algorithm", "a_star_once",
         "--world", world,
+        "--master-seed", "1",
         "--num-seeds", "3",
         "--no-traffic",
     ]
@@ -1318,9 +1321,12 @@ def tc26(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses arena_no_p
         m.pop("git_sha", None)  # robust to dirty tree / absent git
         return m
 
-    with tempfile.TemporaryDirectory() as td_a, \
-            tempfile.TemporaryDirectory() as td_b, \
-            tempfile.TemporaryDirectory() as td_c:
+    # ignore_cleanup_errors: child subprocesses wrote into these dirs; on Windows a lingering
+    # handle or an AV/indexer lock can make rmtree raise PermissionError at block exit, which
+    # would fail --check for a reason unrelated to the assertions.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_a, \
+            tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_b, \
+            tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_c:
         dir_a = _run(td_a, ["--jobs", "1"])
         dir_b = _run(td_b, ["--jobs", "1"])
         dir_c = _run(td_c, ["--jobs", "3"])
@@ -1341,11 +1347,26 @@ def tc26(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses arena_no_p
             "TC26: manifests differ across two same-master-seed --jobs 1 runs"
         )
 
+        # Assert the manifest order against the KNOWN derivation order, not against itself.
+        # With a descending prefix this catches a sorted-by-seed build AND a completion-order
+        # leak in the --jobs 3 path; the old order_a == order_c check compared two outputs of the
+        # same code against ascending default-master seeds and so could distinguish neither.
+        from runners.run_experiment import derive_episode_seeds
+
+        derived = list(derive_episode_seeds(1, 3))
+        assert derived != sorted(derived), "TC26: chosen master must give a non-monotonic prefix"
         man_c = _manifest_no_git(dir_c)
         order_a = [e["seed"] for e in man_a["episodes"]]
         order_c = [e["seed"] for e in man_c["episodes"]]
-        assert order_a == order_c, (
-            "TC26: --jobs 3 reordered the manifest episodes (completion order leaked in)"
+        assert order_a == derived, (
+            f"TC26: --jobs 1 manifest not in derivation order: {order_a} != {derived}"
+        )
+        assert order_c == derived, (
+            f"TC26: --jobs 3 reordered the manifest episodes (completion order leaked in): "
+            f"{order_c} != {derived}"
+        )
+        assert man_a["derived_seeds"] == derived, (
+            "TC26: manifest derived_seeds not in derivation order"
         )
         assert man_a["derived_seeds"] == man_c["derived_seeds"], (
             "TC26: derived_seeds differ between --jobs 1 and --jobs 3"
@@ -1356,7 +1377,9 @@ def tc27(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — writes its own 
     """Phase 3 failure accounting: a malformed (but existing) world makes every child exit
     non-zero; the batch continues, reports the failures, and itself exits non-zero."""
     repo_root = Path(__file__).resolve().parent.parent
-    with tempfile.TemporaryDirectory() as td:
+    # ignore_cleanup_errors: a child subprocess wrote into this dir; on Windows a lingering
+    # handle / AV / indexer lock can make rmtree raise PermissionError at block exit.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
         bad_yaml = Path(td) / "bad.yaml"
         bad_yaml.write_text("not: [valid: arena", encoding="utf-8")  # irsim/yaml rejects this
         r = subprocess.run(
@@ -1376,11 +1399,15 @@ def tc27(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — writes its own 
         assert r.returncode != 0, (
             f"TC27: batch should exit non-zero when all seeds fail; got {r.returncode}"
         )
-        assert "2 runner-failed" in r.stdout, (
-            f"TC27: summary did not report 2 runner failures; stdout tail={r.stdout[-400:]}"
-        )
+        # The manifest checks below are the authoritative assertions: they prove both children
+        # were recorded as runner failures with non-zero exit codes. They also guard the fixture
+        # itself — if this "malformed" world ever parsed and failed only at the planner stage, the
+        # child would exit 0, flipping those checks to status "ok"/exit_code 0 (a loud failure)
+        # instead of a silent pass. We keep one light console check (the failure-detail section
+        # prints) but deliberately do NOT assert the exact "<n> runner-failed" wording, which would
+        # couple the test to console phrasing for no added coverage.
         assert "runner failures:" in r.stdout, (
-            "TC27: summary omitted the per-seed failure detail (stderr tail)"
+            "TC27: summary omitted the per-seed failure detail section"
         )
 
         manifest = json.loads(
