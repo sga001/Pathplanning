@@ -169,7 +169,7 @@ python -m runners.run_experiment --algorithm a_star_once --world arena/arena_v1.
 
 **Flags:**
 - `--master-seed N` (default 20260605), `--num-seeds N` (default 50).
-- `--jobs N` — sequential at 1 (default); N>1 runs up to N child subprocesses concurrently via a `ThreadPoolExecutor` over `subprocess.run` (threads, NOT multiprocessing — the Windows spawn/pickle path never enters). Result bytes are identical at any `--jobs`; only `wallclock_per_step` (a Mission.md "freebie") is perturbed by contention, so produce headline wallclock numbers with `--jobs 1`.
+- `--jobs N` — sequential at 1 (default); N>1 runs up to N child subprocesses concurrently via a `ThreadPoolExecutor` over `subprocess.run` (threads, NOT multiprocessing — the Windows spawn/pickle path never enters). Each seed is isolated, so trace JSONL and the manifest are byte-identical at any `--jobs`; the metrics JSON matches too except `wallclock_per_step` (a Mission.md "freebie"), a `perf_counter` mean that contention perturbs, so produce headline wallclock numbers with `--jobs 1`.
 - `--resume` skips seeds whose `<seed>.json` already exists (default: overwrite).
 - `--traffic` / `--no-traffic` forwarded to each episode (default ON).
 
