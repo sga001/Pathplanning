@@ -1758,17 +1758,30 @@ def tc31(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure unit; synt
 
 
 def tc32(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure unit; synthesizes its own pose/lidar
-    """Mid-replan failure fallback: act() swallows the error, keeps the SAME follower."""
+    """Commitment-horizon swap semantics for a_star_replan (k=1): the three branches.
+
+    A replan firing on a K-th act does NOT unconditionally rebuild the follower —
+    that was the pre-fix behavior the commitment horizon corrects. The follower is
+    swapped ONLY when the held commitment is exhausted or its immediate segment is
+    no longer clear; otherwise the fresh plan is stored but the committed follower
+    is KEPT. This case exercises all three branches at replan_k=1:
+      (a) replan FAILS               -> KEEP the follower (error swallowed).
+      (b) replan SUCCEEDS, segment CLEAR   -> KEEP the follower (committed).
+      (c) replan SUCCEEDS, segment BLOCKED -> SWAP the follower (recommit).
+    """
     _ensure_repo_root_on_path()
     from planners import build_controller  # type: ignore[import-not-found]
+    from planners._grid import load_lidar_geometry  # type: ignore[import-not-found]
 
-    controller = build_controller("a_star_replan", 1)  # replan on every act
     state0 = np.array([2.0, 2.0, 0.0], dtype=np.float64)
     nan_lidar = np.full((360,), np.nan, dtype=np.float64)
+
+    # --- (a) failure -> KEEP -------------------------------------------------
+    controller = build_controller("a_star_replan", 1)  # replan on every act
     controller.reset(yaml_path, (), nan_lidar, state0)
 
     good_follower = controller._follower
-    assert good_follower is not None, "TC32 setup: reset() must build a follower"
+    assert good_follower is not None, "TC32(a) setup: reset() must build a follower"
 
     def raising_compute_path(state: np.ndarray, lidar: np.ndarray) -> Any:
         raise RuntimeError("TC32 injected replan failure")
@@ -1778,27 +1791,65 @@ def tc32(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure unit; synt
         action = controller.act(state0, nan_lidar)
     except Exception as exc:  # noqa: BLE001 — the whole point is that nothing escapes
         raise AssertionError(
-            f"TC32: a failed replan must not propagate out of act(); got "
+            f"TC32(a): a failed replan must not propagate out of act(); got "
             f"{type(exc).__name__}: {exc}"
         )
 
     assert isinstance(action, np.ndarray), (
-        f"TC32: act() must return an ndarray after a failed replan, got {type(action).__name__}"
+        f"TC32(a): act() must return an ndarray after a failed replan, got {type(action).__name__}"
     )
-    assert action.shape == (2, 1), f"TC32: action shape must be (2, 1), got {action.shape}"
+    assert action.shape == (2, 1), f"TC32(a): action shape must be (2, 1), got {action.shape}"
     assert np.issubdtype(action.dtype, np.floating), (
-        f"TC32: action dtype must be float, got {action.dtype}"
+        f"TC32(a): action dtype must be float, got {action.dtype}"
     )
-    assert np.all(np.isfinite(action)), "TC32: action must be finite after a failed replan"
+    assert np.all(np.isfinite(action)), "TC32(a): action must be finite after a failed replan"
     assert controller._follower is good_follower, (
-        "TC32: a failed replan must KEEP the existing follower object, not rebuild it"
+        "TC32(a): a failed replan must KEEP the existing follower object, not rebuild it"
     )
 
-    # Restore a working compute_path; the next replan must SWAP the follower.
+    # --- (b) success + clear segment -> KEEP ---------------------------------
+    # Restore the real compute_path. An all-NaN frame folds to the bare static
+    # grid, so the immediate segment (2,2)->current target waypoint is clear and
+    # the follower is not finished: the successful replan must KEEP the follower.
     del controller.compute_path  # restore the bound base-class method
     controller.act(state0, nan_lidar)
-    assert controller._follower is not good_follower, (
-        "TC32: a successful replan must build a new follower (the swap path is live)"
+    assert controller._follower is good_follower, (
+        "TC32(b): a successful replan whose immediate segment stays clear must KEEP "
+        "the committed follower (the commitment horizon must not rebuild it)"
+    )
+
+    # --- (c) success + blocked segment -> SWAP -------------------------------
+    # Fresh controller at the start; place a single finite lidar return ON the
+    # bearing of the current target waypoint so the resulting fold marks the
+    # immediate segment blocked. A* still routes around the single disk, so the
+    # replan succeeds and the follower must be SWAPPED.
+    controller_c = build_controller("a_star_replan", 1)
+    controller_c.reset(yaml_path, (), nan_lidar, state0)
+    follower_c = controller_c._follower
+    assert follower_c is not None, "TC32(c) setup: reset() must build a follower"
+
+    position = np.array([2.0, 2.0], dtype=np.float64)
+    target = follower_c.current_waypoint(position)
+    delta = np.asarray(target, dtype=np.float64) - position
+    delta_norm = float(np.linalg.norm(delta))
+    assert delta_norm > 1e-6, (
+        "TC32(c) setup: the current target waypoint must not coincide with the start"
+    )
+    desired_bearing = float(np.arctan2(delta[1], delta[0]))  # robot theta = 0
+
+    geom = load_lidar_geometry(yaml_path)
+    bearings = np.linspace(geom.angle_min, geom.angle_max, geom.number)
+    beam = int(np.argmin(np.abs(bearings - desired_bearing)))
+
+    blocking_lidar = np.full((geom.number,), np.nan, dtype=np.float64)
+    # Hit at half the segment length lands ON the segment, inside the inflation
+    # band, so segment_is_clear_grid reports the immediate segment blocked.
+    blocking_lidar[beam] = 0.5 * delta_norm
+
+    controller_c.act(state0, blocking_lidar)
+    assert controller_c._follower is not follower_c, (
+        "TC32(c): a successful replan whose immediate segment is BLOCKED must SWAP "
+        "the follower (recommit to the fresh plan)"
     )
 
 
@@ -2181,6 +2232,522 @@ def tc37(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own in
 
 
 # ---------------------------------------------------------------------------
+# TC38..TC45 — the reactive (DWA / APF) + sampling (RRT / RRT*) families plus
+# the commitment-horizon fix proof. TC38/TC39 are traffic-ON reactive drives;
+# TC40/TC41 are the --no-traffic sampling drives (TC40 also proves trace
+# determinism, TC41 also prints the RRT*-vs-RRT planned-cost observation);
+# TC42 is the sealed-start planner-failure audit for both samplers; TC43 is the
+# pure-registry validation across all six new keys; TC44 is the two sampling
+# replan families end-to-end with --replan-k; TC45 is the BINDING gate that the
+# commitment horizon lets the grid replanners reach the goal. All in-process
+# imports reuse the tc28-tc37 repo-root helper.
+# ---------------------------------------------------------------------------
+
+
+def tc38(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """dwa traffic-ON drive via runner: exit 0, runs to completion, 8-key trace per line.
+
+    DWA reacts to the live lidar, so under traffic it may crash or time out — that
+    is fine. We assert only that the episode RAN (reset never raises, so the trace
+    is always written) and that every trace line carries the 8th traffic key.
+    """
+    repo_root = _ensure_repo_root_on_path()
+    seed_value = "38"
+    world_stem = Path(yaml_path).stem
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        r = subprocess.run(
+            [
+                sys.executable, "-m", "runners.run_episode",
+                "--algorithm", "dwa",
+                "--seed", seed_value,
+                "--world", yaml_path,
+                "--traffic",  # default; stated explicitly
+                "--results-dir", td,
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert r.returncode == 0, (
+            f"TC38 dwa runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+        )
+
+        out_dir = Path(td) / world_stem / "dwa"
+        json_path = out_dir / f"{seed_value}.json"
+        jsonl_path = out_dir / f"{seed_value}.trace.jsonl"
+        assert json_path.exists(), f"TC38: metrics JSON missing at {json_path}"
+        assert jsonl_path.exists(), f"TC38: trace JSONL missing at {jsonl_path}"
+
+        metrics = json.loads(json_path.read_text(encoding="utf-8"))
+        assert metrics["planner_error"] is None, (
+            f"TC38: dwa reset must not raise; planner_error={metrics['planner_error']}"
+        )
+
+        lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+        assert lines, "TC38: dwa traffic trace JSONL is empty"
+        for idx, raw in enumerate(lines):
+            rec = json.loads(raw)
+            assert isinstance(rec, dict), f"TC38: trace line {idx} is not an object"
+            assert "dynamic_obstacles_sha256" in rec, (
+                f"TC38: trace line {idx} missing dynamic_obstacles_sha256 with traffic on; "
+                f"keys={sorted(rec)}"
+            )
+            assert len(rec) == 8, (
+                f"TC38: trace line {idx} must have 8 keys with traffic on, got {len(rec)}: "
+                f"{sorted(rec)}"
+            )
+
+
+def tc39(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """apf traffic-ON drive via runner: exit 0, runs to completion, 8-key trace per line.
+
+    Like TC38: APF reacts to the live lidar and may crash or time out under
+    traffic; we assert only that it RAN and that every trace line is the 8-key
+    traffic schema.
+    """
+    repo_root = _ensure_repo_root_on_path()
+    seed_value = "39"
+    world_stem = Path(yaml_path).stem
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        r = subprocess.run(
+            [
+                sys.executable, "-m", "runners.run_episode",
+                "--algorithm", "apf",
+                "--seed", seed_value,
+                "--world", yaml_path,
+                "--traffic",  # default; stated explicitly
+                "--results-dir", td,
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert r.returncode == 0, (
+            f"TC39 apf runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+        )
+
+        out_dir = Path(td) / world_stem / "apf"
+        json_path = out_dir / f"{seed_value}.json"
+        jsonl_path = out_dir / f"{seed_value}.trace.jsonl"
+        assert json_path.exists(), f"TC39: metrics JSON missing at {json_path}"
+        assert jsonl_path.exists(), f"TC39: trace JSONL missing at {jsonl_path}"
+
+        metrics = json.loads(json_path.read_text(encoding="utf-8"))
+        assert metrics["planner_error"] is None, (
+            f"TC39: apf reset must not raise; planner_error={metrics['planner_error']}"
+        )
+
+        lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+        assert lines, "TC39: apf traffic trace JSONL is empty"
+        for idx, raw in enumerate(lines):
+            rec = json.loads(raw)
+            assert isinstance(rec, dict), f"TC39: trace line {idx} is not an object"
+            assert "dynamic_obstacles_sha256" in rec, (
+                f"TC39: trace line {idx} missing dynamic_obstacles_sha256 with traffic on; "
+                f"keys={sorted(rec)}"
+            )
+            assert len(rec) == 8, (
+                f"TC39: trace line {idx} must have 8 keys with traffic on, got {len(rec)}: "
+                f"{sorted(rec)}"
+            )
+
+
+def tc40(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """rrt_once --no-traffic reaches the goal + two same-seed runs are byte-identical.
+
+    AC5: rrt_once drives arena_v1 to the goal (~73 s measured) well under the cap.
+    AC4: the deterministic single-plan RNG makes two same-seed runs produce
+    byte-identical trace JSONL.
+    """
+    repo_root = _ensure_repo_root_on_path()
+    seed_value = "40"
+    world_stem = Path(yaml_path).stem
+    runner_args = [
+        sys.executable, "-m", "runners.run_episode",
+        "--algorithm", "rrt_once",
+        "--seed", seed_value,
+        "--world", yaml_path,
+        "--no-traffic",
+    ]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_a, \
+            tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_b:
+        for td in (td_a, td_b):
+            r = subprocess.run(
+                [*runner_args, "--results-dir", td],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            assert r.returncode == 0, (
+                f"TC40 rrt_once runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+            )
+
+        json_a = Path(td_a) / world_stem / "rrt_once" / f"{seed_value}.json"
+        json_b = Path(td_b) / world_stem / "rrt_once" / f"{seed_value}.json"
+        jsonl_a = Path(td_a) / world_stem / "rrt_once" / f"{seed_value}.trace.jsonl"
+        jsonl_b = Path(td_b) / world_stem / "rrt_once" / f"{seed_value}.trace.jsonl"
+        for p in (json_a, json_b, jsonl_a, jsonl_b):
+            assert p.exists(), f"TC40: expected output missing at {p}"
+
+        for json_path in (json_a, json_b):
+            metrics = json.loads(json_path.read_text(encoding="utf-8"))
+            assert metrics["planner_error"] is None, (
+                f"TC40 planner_error not None at {json_path}: {metrics}"
+            )
+            assert metrics["time_to_goal"] is not None, (
+                f"TC40 rrt_once did not reach the goal at {json_path}: {metrics}"
+            )
+            assert metrics["time_to_goal"] <= 110.0, (
+                f"TC40 rrt_once time_to_goal {metrics['time_to_goal']} exceeds the 110 s "
+                f"margin (measured ~73 s) at {json_path}"
+            )
+
+        assert filecmp.cmp(str(jsonl_a), str(jsonl_b), shallow=False), (
+            "TC40: two same-seed rrt_once --no-traffic runs produced differing trace JSONL; "
+            "the deterministic single-plan RNG (AC4) regressed"
+        )
+
+
+def tc41(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """rrt_star_once --no-traffic reaches the goal (BLOCKING) + planned-cost observation (AC7-obs).
+
+    Subprocess part: rrt_star_once drives arena_v1 to the goal (~71 s measured)
+    under the 110 s margin. In-process part (NON-blocking): plan RRT and RRT* on
+    the SAME static grid from the SAME seed and print both planned costs as an
+    observation — RRT* is expected to be <= RRT, but the costs are NOT asserted.
+    """
+    repo_root = _ensure_repo_root_on_path()
+    seed_value = "41"
+    world_stem = Path(yaml_path).stem
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        r = subprocess.run(
+            [
+                sys.executable, "-m", "runners.run_episode",
+                "--algorithm", "rrt_star_once",
+                "--seed", seed_value,
+                "--world", yaml_path,
+                "--no-traffic",
+                "--results-dir", td,
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert r.returncode == 0, (
+            f"TC41 rrt_star_once runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+        )
+        json_path = Path(td) / world_stem / "rrt_star_once" / f"{seed_value}.json"
+        assert json_path.exists(), f"TC41: metrics JSON missing at {json_path}"
+        metrics = json.loads(json_path.read_text(encoding="utf-8"))
+        assert metrics["planner_error"] is None, (
+            f"TC41 planner_error not None: {metrics}"
+        )
+        assert metrics["time_to_goal"] is not None, (
+            f"TC41 rrt_star_once did not reach the goal (time_to_goal is None): {metrics}"
+        )
+        assert metrics["time_to_goal"] <= 110.0, (
+            f"TC41 rrt_star_once time_to_goal {metrics['time_to_goal']} exceeds the 110 s "
+            f"margin (measured ~71 s)"
+        )
+
+    # --- AC7-obs: print the RRT vs RRT* planned costs on the same static grid. ---
+    import planners.rrt as rrt  # type: ignore[import-not-found]
+    import planners.rrt_star as rrt_star  # type: ignore[import-not-found]
+    from planners.rrt import RRT_SEED  # type: ignore[import-not-found]
+    from manual_astar import (  # type: ignore[import-not-found]
+        GRID_RESOLUTION,
+        SAFETY_MARGIN,
+        build_occupancy_grid,
+        load_world,
+    )
+
+    world = load_world(yaml_path)
+    grid = build_occupancy_grid(world, GRID_RESOLUTION, SAFETY_MARGIN)
+    start_xy = np.asarray(world.start, dtype=float)[:2]
+    goal_xy = np.asarray(world.goal, dtype=float)[:2]
+
+    rrt_points = rrt.rrt_plan(
+        grid.cells, grid, start_xy, goal_xy, np.random.default_rng(RRT_SEED)
+    )
+    rrt_star_points = rrt_star.rrt_star_plan(
+        grid.cells, grid, start_xy, goal_xy, np.random.default_rng(RRT_SEED)
+    )
+    rrt_cost = rrt.rrt_planned_cost(rrt_points)
+    rrt_star_cost = rrt.rrt_planned_cost(rrt_star_points)
+    print(
+        f"TC41 AC7-obs: rrt planned cost = {rrt_cost:.3f} m, "
+        f"rrt_star planned cost = {rrt_star_cost:.3f} m"
+    )
+
+
+def tc42(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal world
+    """Sealed-start planner failure: rrt_once and rrt_star_once both raise, no trace written.
+
+    On arena_no_path.yaml the start is walled in, so both samplers exhaust their
+    iteration budget and raise — the runner must record planner_error and write
+    NO trace JSONL (mirrors TC16's audit).
+    """
+    repo_root = _ensure_repo_root_on_path()
+    no_path_yaml = str(repo_root / "arena" / "arena_no_path.yaml")
+    for algorithm, seed_value in (("rrt_once", "42"), ("rrt_star_once", "42")):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            r = subprocess.run(
+                [
+                    sys.executable, "-m", "runners.run_episode",
+                    "--algorithm", algorithm,
+                    "--seed", seed_value,
+                    "--world", no_path_yaml,
+                    "--no-traffic",
+                    "--results-dir", td,
+                ],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            assert r.returncode == 0, (
+                f"TC42 {algorithm} runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+            )
+
+            json_path = Path(td) / "arena_no_path" / algorithm / f"{seed_value}.json"
+            jsonl_path = Path(td) / "arena_no_path" / algorithm / f"{seed_value}.trace.jsonl"
+            assert json_path.exists(), f"TC42 {algorithm}: metrics JSON missing at {json_path}"
+            assert not jsonl_path.exists(), (
+                f"TC42 {algorithm}: trace JSONL must NOT exist on planner failure; "
+                f"found {jsonl_path}"
+            )
+
+            metrics = json.loads(json_path.read_text(encoding="utf-8"))
+            assert metrics["planner_error"] is not None, (
+                f"TC42 {algorithm} planner_error must not be None: {metrics}"
+            )
+            assert metrics["time_to_goal"] is None, (
+                f"TC42 {algorithm} time_to_goal must be None on planner failure: {metrics}"
+            )
+
+
+def tc43(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure unit; uses the registry only
+    """Registration + --replan-k validation for all six new keys (reactive + sampling).
+
+    Mirrors TC33 across dwa / apf / rrt_once / rrt_star_once (reject --replan-k)
+    and rrt_replan / rrt_star_replan (require it), checking the name==key invariant
+    (AC15), the _k<K> label folding (AC6), and ALGORITHMS membership for all six.
+    """
+    _ensure_repo_root_on_path()
+    from planners import ALGORITHMS, algorithm_label, build_controller  # type: ignore[import-not-found]
+
+    once_like = ("dwa", "apf", "rrt_once", "rrt_star_once")
+    replan_like = ("rrt_replan", "rrt_star_replan")
+
+    # The non-replan keys must REJECT a --replan-k.
+    for name in once_like:
+        try:
+            build_controller(name, 5)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"TC43: build_controller({name!r}, 5) must raise ValueError "
+                f"({name} is not a REPLAN family)"
+            )
+
+    # The replan keys must REQUIRE a --replan-k.
+    for name in replan_like:
+        try:
+            build_controller(name, None)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                f"TC43: build_controller({name!r}, None) must raise ValueError "
+                f"({name} requires --replan-k)"
+            )
+
+    # Valid combos construct, name==key (AC15), membership, and label folding (AC6).
+    valid_pairs: list[tuple[str, Any]] = [
+        ("dwa", None),
+        ("apf", None),
+        ("rrt_once", None),
+        ("rrt_star_once", None),
+        ("rrt_replan", 5),
+        ("rrt_star_replan", 5),
+    ]
+    for name, k in valid_pairs:
+        controller = build_controller(name, k)
+        assert controller.name == name, (
+            f"TC43: build_controller({name!r}, {k!r}).name == {controller.name!r}, "
+            f"expected {name!r}"
+        )
+        assert name in ALGORITHMS, f"TC43: {name!r} must be a key in ALGORITHMS"
+
+    # Labels: the two replan families fold _k5, the others use the bare key.
+    assert algorithm_label("rrt_replan", 5) == "rrt_replan_k5", (
+        f"TC43: algorithm_label('rrt_replan', 5) == {algorithm_label('rrt_replan', 5)!r}, "
+        f"expected 'rrt_replan_k5'"
+    )
+    assert algorithm_label("rrt_star_replan", 5) == "rrt_star_replan_k5", (
+        f"TC43: algorithm_label('rrt_star_replan', 5) == "
+        f"{algorithm_label('rrt_star_replan', 5)!r}, expected 'rrt_star_replan_k5'"
+    )
+    for name in once_like:
+        assert algorithm_label(name, 5) == name, (
+            f"TC43: algorithm_label({name!r}, 5) == {algorithm_label(name, 5)!r}, "
+            f"expected the bare key {name!r}"
+        )
+
+
+def tc44(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """rrt_replan and rrt_star_replan traffic-ON via runner (--replan-k 5): labeled dir, 8-key trace.
+
+    Mirrors TC30: each sampling replan family must plan at t=0 (no planner_error),
+    write to its _k5 labeled dir, and emit the 8-key traffic trace per line. The
+    episode may crash or time out — only completion + schema are asserted.
+    """
+    repo_root = _ensure_repo_root_on_path()
+    seed_value = "44"
+    replan_k = "5"
+    world_stem = Path(yaml_path).stem
+    for algorithm, label in (("rrt_replan", "rrt_replan_k5"),
+                             ("rrt_star_replan", "rrt_star_replan_k5")):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            r = subprocess.run(
+                [
+                    sys.executable, "-m", "runners.run_episode",
+                    "--algorithm", algorithm,
+                    "--replan-k", replan_k,
+                    "--seed", seed_value,
+                    "--world", yaml_path,
+                    "--traffic",  # default; stated explicitly
+                    "--results-dir", td,
+                ],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            assert r.returncode == 0, (
+                f"TC44 {algorithm} runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+            )
+
+            out_dir = Path(td) / world_stem / label
+            json_path = out_dir / f"{seed_value}.json"
+            jsonl_path = out_dir / f"{seed_value}.trace.jsonl"
+            assert json_path.exists(), (
+                f"TC44 {algorithm}: metrics JSON missing at {json_path} — "
+                f"label must be {label!r}"
+            )
+            assert jsonl_path.exists(), f"TC44 {algorithm}: trace JSONL missing at {jsonl_path}"
+
+            metrics = json.loads(json_path.read_text(encoding="utf-8"))
+            assert metrics["planner_error"] is None, (
+                f"TC44 {algorithm} must plan successfully at t=0; "
+                f"planner_error={metrics['planner_error']}"
+            )
+
+            lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+            assert lines, f"TC44 {algorithm}: trace JSONL is empty"
+            for idx, raw in enumerate(lines):
+                rec = json.loads(raw)
+                assert isinstance(rec, dict), f"TC44 {algorithm}: trace line {idx} is not an object"
+                assert "dynamic_obstacles_sha256" in rec, (
+                    f"TC44 {algorithm}: trace line {idx} missing dynamic_obstacles_sha256 "
+                    f"with traffic on; keys={sorted(rec)}"
+                )
+                assert len(rec) == 8, (
+                    f"TC44 {algorithm}: trace line {idx} must have 8 keys with traffic on, "
+                    f"got {len(rec)}: {sorted(rec)}"
+                )
+
+
+def tc45(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """Commitment-horizon fix proof (BINDING): grid replanners reach the goal + commit.
+
+    Part 1 (subprocess): a_star_replan and dijkstra_replan at --replan-k 5
+    --no-traffic each reach the goal (~86 s measured) with no crash and no
+    timeout. These previously timed out / drove into a wall — the fix is what
+    makes them traverse.
+
+    Part 2 (in-process follower-identity proof): build a_star_replan k=5, reset at
+    (2,2) with an all-NaN lidar, then act() five times. On a clear fold the
+    immediate segment stays clear, so the K-th (5th) replan must KEEP the existing
+    follower — the commitment held, the follower was not rebuilt.
+    """
+    repo_root = _ensure_repo_root_on_path()
+    world_stem = Path(yaml_path).stem
+
+    # --- Part 1: both grid replan families reach the goal --no-traffic. ---
+    for algorithm, label, seed_value in (
+        ("a_star_replan", "a_star_replan_k5", "45"),
+        ("dijkstra_replan", "dijkstra_replan_k5", "45"),
+    ):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+            r = subprocess.run(
+                [
+                    sys.executable, "-m", "runners.run_episode",
+                    "--algorithm", algorithm,
+                    "--replan-k", "5",
+                    "--seed", seed_value,
+                    "--world", yaml_path,
+                    "--no-traffic",
+                    "--results-dir", td,
+                ],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            assert r.returncode == 0, (
+                f"TC45 {algorithm} runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+            )
+            json_path = Path(td) / world_stem / label / f"{seed_value}.json"
+            assert json_path.exists(), f"TC45 {algorithm}: metrics JSON missing at {json_path}"
+            metrics = json.loads(json_path.read_text(encoding="utf-8"))
+            assert metrics["planner_error"] is None, (
+                f"TC45 {algorithm} planner_error not None: {metrics}"
+            )
+            assert metrics["time_to_goal"] is not None, (
+                f"TC45 {algorithm} did not reach the goal (time_to_goal is None) — the "
+                f"commitment-horizon fix regressed: {metrics}"
+            )
+            assert metrics["time_to_goal"] <= 110.0, (
+                f"TC45 {algorithm} time_to_goal {metrics['time_to_goal']} exceeds the 110 s "
+                f"margin (measured ~86 s): {metrics}"
+            )
+            assert metrics["crashed"] is False, (
+                f"TC45 {algorithm} must not crash on the static map: {metrics}"
+            )
+            assert metrics["timed_out"] is False, (
+                f"TC45 {algorithm} must not time out on the static map: {metrics}"
+            )
+
+    # --- Part 2: follower-identity proof (commitment actually held). ---
+    from planners import build_controller  # type: ignore[import-not-found]
+
+    controller = build_controller("a_star_replan", 5)
+    state0 = np.array([2.0, 2.0, 0.0], dtype=np.float64)
+    nan_lidar = np.full((360,), np.nan, dtype=np.float64)
+    controller.reset(yaml_path, (), nan_lidar, state0)
+
+    good = controller._follower
+    assert good is not None, "TC45 setup: reset() must build a follower"
+
+    # Five acts: the 5th is the replan tick. On the bare static fold the immediate
+    # segment stays clear and the follower is not finished, so the follower must be
+    # KEPT (committed), not rebuilt.
+    for _ in range(5):
+        controller.act(state0, nan_lidar)
+
+    assert controller._follower is good, (
+        "TC45: on a clear fold the K-th replan must KEEP the committed follower "
+        "(the commitment horizon must not rebuild it every K acts)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI runner — --check (default) or --render. See module docstring above.
 # ---------------------------------------------------------------------------
 
@@ -2225,6 +2792,14 @@ def _run_checks(yaml_path: str, seed: int) -> int:
         ("TC35: D* Lite optimal static path (== A* cost) + reaches goal", tc35),
         ("TC36: D* Lite incremental == from-scratch (binding block)", tc36),
         ("TC37: d_star_lite registered + rejects --replan-k + traffic e2e", tc37),
+        ("TC38: dwa traffic-on drive via runner + 8-key trace", tc38),
+        ("TC39: apf traffic-on drive via runner + 8-key trace", tc39),
+        ("TC40: rrt_once --no-traffic reaches goal + trace determinism", tc40),
+        ("TC41: rrt_star_once reaches goal + RRT*-vs-RRT planned-cost obs", tc41),
+        ("TC42: rrt_once/rrt_star_once sealed-start planner failure", tc42),
+        ("TC43: --replan-k validation for the 6 reactive/sampling keys", tc43),
+        ("TC44: rrt_replan/rrt_star_replan traffic e2e + labeled dir", tc44),
+        ("TC45: commitment-horizon fix proof (goal + follower identity)", tc45),
     ]
     failures = 0
     for label, fn in cases:
@@ -2267,7 +2842,7 @@ def _parse_args() -> argparse.Namespace:
     group.add_argument(
         "--check",
         action="store_true",
-        help="Run TC1-TC37 headless (38 cases, incl. Phase 2 traffic + Phase 3 batch runner + replanning + D* Lite families)",
+        help="Run TC1-TC45 headless (46 cases, incl. Phase 2 traffic + Phase 3 batch runner + replanning + D* Lite + reactive (DWA/APF) + sampling (RRT/RRT*) families)",
     )
     return parser.parse_args()
 
