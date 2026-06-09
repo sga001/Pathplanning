@@ -12,6 +12,7 @@ CLI:
     python -m runners.run_experiment \
         --algorithm <name>      # required; e.g. "a_star_once"
         --world <yaml_path>     # required; e.g. arena/arena_v1.yaml
+        [--replan-k <int>]      # required for the _replan family, forbidden otherwise
         [--master-seed <int>]   # default DEFAULT_MASTER_SEED
         [--num-seeds <int>]     # default 50; >= 1
         [--jobs <int>]          # default 1 (sequential); N>1 => bounded concurrency
@@ -20,10 +21,12 @@ CLI:
         [--traffic|--no-traffic]# Phase 2 crossing traffic, default ON
 
 Outputs (per seed, written by the child run_episode):
-    <results-dir>/<world_stem>/<algorithm>/<seed>.json
-    <results-dir>/<world_stem>/<algorithm>/<seed>.trace.jsonl   (only on planning success)
+    <results-dir>/<world_stem>/<label>/<seed>.json
+    <results-dir>/<world_stem>/<label>/<seed>.trace.jsonl   (only on planning success)
 Plus a provenance receipt written by this module:
-    <results-dir>/<world_stem>/<algorithm>/_manifest.json
+    <results-dir>/<world_stem>/<label>/_manifest.json
+where <label> = algorithm_label(<algorithm>, <replan-k>) (e.g. "a_star_once",
+"a_star_replan_k5"), so replan cadences do not collide.
 
 Execution:
     --jobs 1 (default) runs seeds sequentially. --jobs N>1 runs up to N child
@@ -43,7 +46,8 @@ Execution:
 Exit codes:
     0 — every non-skipped seed's subprocess exited 0 (ran to completion)
     1 — >= 1 seed's subprocess exited non-zero (continue-and-report)
-    2 — argparse error / up-front validation failure (unknown algorithm, missing world)
+    2 — argparse error / up-front validation failure (unknown algorithm, missing world,
+        bad --replan-k for the chosen family)
 
 Note: a child exit of 0 includes in-sim crashes, timeouts, and planner failures
 (those are recorded inside the metrics JSON, not the exit code). "succeeded" below
@@ -69,6 +73,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from planners import algorithm_label, build_controller  # noqa: E402
 from runners._layout import episode_out_dir  # noqa: E402
 from runners.run_episode import ALGORITHMS  # noqa: E402
 
@@ -174,6 +179,7 @@ def _run_one_episode(
     *,
     seed: int,
     algorithm: str,
+    replan_k: int | None,
     world_abs: str,
     results_dir: str,
     traffic: bool,
@@ -193,6 +199,10 @@ def _run_one_episode(
         "--results-dir",
         results_dir,
     ]
+    # Forward the cadence only when set; a non-replan family must NOT see the flag
+    # (run_episode rejects --replan-k for those, so passing None would be wrong).
+    if replan_k is not None:
+        cmd.extend(["--replan-k", str(replan_k)])
     cmd.append("--traffic" if traffic else "--no-traffic")
     # capture_output buffers the child's full stdout/stderr though only the last
     # STDERR_TAIL_LINES are surfaced; that is intentional — we need the tail on
@@ -242,6 +252,7 @@ class RunnerArgs:
 
     algorithm: str
     world: str
+    replan_k: int | None
     master_seed: int
     num_seeds: int
     jobs: int
@@ -267,6 +278,15 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
         help="Path to the world YAML (e.g. arena/arena_v1.yaml).",
     )
     parser.add_argument(
+        "--replan-k",
+        type=int,
+        default=None,
+        help=(
+            "Replan cadence for the _replan family (act every k-th step). "
+            "Required for those algorithms, forbidden for the rest."
+        ),
+    )
+    parser.add_argument(
         "--master-seed",
         type=int,
         default=DEFAULT_MASTER_SEED,
@@ -287,7 +307,7 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
     parser.add_argument(
         "--results-dir",
         default=DEFAULT_RESULTS_DIR,
-        help="Output directory root; results go in <results-dir>/<world_stem>/<algorithm>/.",
+        help="Output directory root; results go in <results-dir>/<world_stem>/<label>/ (label = algorithm, or algorithm_k<K> for replan families).",
     )
     parser.add_argument(
         "--resume",
@@ -306,6 +326,7 @@ def _parse_args(argv: list[str] | None) -> RunnerArgs:
     return RunnerArgs(
         algorithm=ns.algorithm,
         world=ns.world,
+        replan_k=None if ns.replan_k is None else int(ns.replan_k),
         master_seed=int(ns.master_seed),
         num_seeds=int(ns.num_seeds),
         jobs=int(ns.jobs),
@@ -331,6 +352,16 @@ def main(argv: list[str] | None = None) -> int:
     # (a bare traceback) instead of the runner's documented validation-failure path.
     if args.master_seed < 0:
         print(f"error: --master-seed must be >= 0, got {args.master_seed}", file=sys.stderr)
+        return 2
+
+    # Validate the (algorithm, replan-k) family combo ONCE before spawning any child
+    # (mirrors run_episode's discipline): reject a _replan family with no --replan-k,
+    # a --replan-k handed to a non-replan family, or an out-of-range cadence here —
+    # exit 2 like the other up-front checks — rather than failing 50 subprocesses.
+    try:
+        build_controller(args.algorithm, args.replan_k)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
 
     # Resolve --world to an absolute path ONCE so this process's existence check
@@ -360,7 +391,11 @@ def main(argv: list[str] | None = None) -> int:
 
     seeds = derive_episode_seeds(args.master_seed, args.num_seeds)
 
-    out_dir = episode_out_dir(results_dir_abs, world_stem, args.algorithm)
+    # Partition results by the label, not the bare family name, so each child
+    # (which computes the same label) lands in this directory and replan cadences
+    # do not collide (a_star_replan_k5 vs a_star_replan_k10).
+    label = algorithm_label(args.algorithm, args.replan_k)
+    out_dir = episode_out_dir(results_dir_abs, world_stem, label)
     out_dir.mkdir(parents=True, exist_ok=True)  # pre-create once; children won't race on it
 
     print(
@@ -390,6 +425,7 @@ def main(argv: list[str] | None = None) -> int:
         return _run_one_episode(
             seed=seed,
             algorithm=args.algorithm,
+            replan_k=args.replan_k,
             world_abs=world_abs_str,
             results_dir=results_dir_abs,
             traffic=args.traffic,
@@ -421,6 +457,7 @@ def main(argv: list[str] | None = None) -> int:
         "master_seed": args.master_seed,
         "num_seeds": args.num_seeds,
         "algorithm": args.algorithm,
+        "replan_k": args.replan_k,
         "world": world_for_manifest,
         "world_stem": world_stem,
         "traffic": args.traffic,

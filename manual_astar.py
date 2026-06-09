@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import heapq
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -317,9 +318,16 @@ def reconstruct_path(
     return path
 
 
-def astar_search(grid: OccupancyGrid, start: tuple[int, int], goal: tuple[int, int]) -> list[tuple[int, int]]:
+def astar_search(
+    grid: OccupancyGrid,
+    start: tuple[int, int],
+    goal: tuple[int, int],
+    heuristic_fn: Callable[[tuple[int, int], tuple[int, int]], float] | None = None,
+) -> list[tuple[int, int]]:
+    h = heuristic_fn if heuristic_fn is not None else heuristic
+
     open_heap: list[tuple[float, tuple[int, int]]] = []
-    heapq.heappush(open_heap, (heuristic(start, goal), start))
+    heapq.heappush(open_heap, (h(start, goal), start))
 
     parents: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
     g_score: dict[tuple[int, int], float] = {start: 0.0}
@@ -363,7 +371,7 @@ def astar_search(grid: OccupancyGrid, start: tuple[int, int], goal: tuple[int, i
 
             parents[neighbor] = current
             g_score[neighbor] = tentative_cost
-            priority = tentative_cost + heuristic(neighbor, goal)
+            priority = tentative_cost + h(neighbor, goal)
             heapq.heappush(open_heap, (priority, neighbor))
 
     raise RuntimeError('A* could not find a path from the start to the goal.')
@@ -488,8 +496,8 @@ class WaypointFollower:
         return self._waypoints[self._index]
 
 
-def compute_action(robot, follower: WaypointFollower) -> np.ndarray:
-    x_coord, y_coord, theta = robot.state[:, 0]
+def compute_action_from_state(state_xyt: np.ndarray, follower: WaypointFollower) -> np.ndarray:
+    x_coord, y_coord, theta = state_xyt
     position = np.array([x_coord, y_coord], dtype=float)
     waypoint = follower.current_waypoint(position)
 
@@ -510,6 +518,10 @@ def compute_action(robot, follower: WaypointFollower) -> np.ndarray:
         linear_velocity = MAX_LINEAR_SPEED
 
     return np.array([[linear_velocity], [angular_velocity]], dtype=float)
+
+
+def compute_action(robot, follower: WaypointFollower) -> np.ndarray:
+    return compute_action_from_state(robot.state[:, 0], follower)
 
 
 def plan_waypoints(map_path: str) -> tuple[WorldModel, OccupancyGrid, list[tuple[int, int]], list[np.ndarray]]:

@@ -1423,6 +1423,764 @@ def tc27(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — writes its own 
 
 
 # ---------------------------------------------------------------------------
+# TC28..TC34 — Group A: the lidar-folding replanning family (a_star_replan /
+# dijkstra_once / dijkstra_replan) and the planner registry. Pure-unit cases
+# (TC28/TC31/TC32/TC33) build controllers/grids in-process; subprocess cases
+# (TC29/TC30/TC34) shell out to `python -m runners.run_episode` exactly like
+# TC14/TC15/TC22. Repo root must be importable for the in-process imports of
+# `planners` / `planners._grid` / `manual_astar` (mirrors tc10's sys.path bump).
+# ---------------------------------------------------------------------------
+
+
+def _ensure_repo_root_on_path() -> Path:
+    """Put the repo root on sys.path (idempotent) and return it.
+
+    The in-process Group-A cases import `planners`, `planners._grid`, and
+    `manual_astar`, all of which live at the repo root. `python arena/arena.py`
+    only puts `arena/` on sys.path, so bump the root the same way tc10 does.
+    """
+    import sys
+    repo_root = Path(__file__).resolve().parent.parent
+    repo_root_str = str(repo_root)
+    if repo_root_str not in sys.path:
+        sys.path.insert(0, repo_root_str)
+    return repo_root
+
+
+def tc28(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure unit; synthesizes its own pose/lidar
+    """Lidar→grid fold geometry: one finite beam marks its world-hit cell, memorylessly."""
+    _ensure_repo_root_on_path()
+    from planners._grid import lidar_to_occupancy, load_lidar_geometry  # type: ignore[import-not-found]
+    from manual_astar import (  # type: ignore[import-not-found]
+        GRID_RESOLUTION,
+        SAFETY_MARGIN,
+        build_occupancy_grid,
+        load_world,
+        world_to_grid,
+    )
+
+    world = load_world(yaml_path)
+    grid = build_occupancy_grid(world, GRID_RESOLUTION, SAFETY_MARGIN)
+    static_cells = grid.cells
+    geom = load_lidar_geometry(yaml_path)
+    inflation = world.robot_radius + SAFETY_MARGIN
+
+    bearings = np.linspace(geom.angle_min, geom.angle_max, geom.number)
+
+    # Open-space pose near the (2,2) start; beam 180 (bearing ~0) points ~+x into
+    # the clear region, so the hit lands on an unblocked static cell.
+    state = np.array([5.0, 5.0, 0.0], dtype=np.float64)
+    beam_index = 180
+    beam_range = 2.0
+
+    lidar = np.full((geom.number,), np.nan, dtype=np.float64)
+    lidar[beam_index] = beam_range
+
+    world_angle = float(state[2]) + float(bearings[beam_index])
+    hit = state[:2] + beam_range * np.array(
+        [np.cos(world_angle), np.sin(world_angle)], dtype=np.float64
+    )
+    hit_cell = world_to_grid(hit, grid)
+    assert not bool(static_cells[hit_cell]), (
+        f"TC28 setup: chosen hit cell {hit_cell} is already blocked statically; "
+        f"pick a clearer beam/pose"
+    )
+
+    static_sum_before = int(static_cells.sum())
+    folded = lidar_to_occupancy(static_cells, grid, state, lidar, geom, inflation)
+
+    # 1) The hit's cell is now blocked in the fold.
+    assert bool(folded[hit_cell]), (
+        f"TC28: folded hit cell {hit_cell} must be blocked after folding a finite "
+        f"return at beam {beam_index}"
+    )
+    # 2) A far-away open cell stays free (the fold is local to the hit disk).
+    far_cell = world_to_grid(np.array([45.0, 5.0], dtype=np.float64), grid)
+    assert not bool(static_cells[far_cell]), (
+        f"TC28 setup: far cell {far_cell} must be statically open"
+    )
+    assert not bool(folded[far_cell]), (
+        f"TC28: a far-away open cell {far_cell} must stay free after folding one beam"
+    )
+    # 3) The fold returns a NEW array and never mutates the static cells.
+    assert folded is not static_cells, "TC28: fold must return a new array, not the static one"
+    assert int(static_cells.sum()) == static_sum_before, (
+        f"TC28: static_cells was mutated by the fold "
+        f"(sum {static_sum_before} -> {int(static_cells.sum())})"
+    )
+    # 4) Folding an all-NaN scan equals the static grid exactly (no returns => no marks).
+    all_nan = np.full((geom.number,), np.nan, dtype=np.float64)
+    empty_fold = lidar_to_occupancy(static_cells, grid, state, all_nan, geom, inflation)
+    assert np.array_equal(empty_fold, static_cells), (
+        "TC28: folding an all-NaN lidar must reproduce the static grid"
+    )
+    # 5) Pose-dependence: the SAME single-beam lidar folded at a DIFFERENT pose
+    #    marks a different cell (the fold reads the live robot pose).
+    state2 = np.array([10.0, 10.0, 0.0], dtype=np.float64)
+    world_angle2 = float(state2[2]) + float(bearings[beam_index])
+    hit2 = state2[:2] + beam_range * np.array(
+        [np.cos(world_angle2), np.sin(world_angle2)], dtype=np.float64
+    )
+    hit_cell2 = world_to_grid(hit2, grid)
+    assert hit_cell2 != hit_cell, (
+        f"TC28 setup: the two poses must map to distinct hit cells "
+        f"({hit_cell} vs {hit_cell2})"
+    )
+    folded2 = lidar_to_occupancy(static_cells, grid, state2, lidar, geom, inflation)
+    assert bool(folded2[hit_cell2]), (
+        f"TC28: pose-2 fold must block its own hit cell {hit_cell2}"
+    )
+    assert not bool(folded2[hit_cell]) or bool(static_cells[hit_cell]), (
+        f"TC28: pose-2 fold must NOT block pose-1's hit cell {hit_cell} "
+        f"(the fold is pose-dependent)"
+    )
+
+
+def tc29(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """Dijkstra == A* optimal (equal octile cost) + dijkstra_once reaches the goal."""
+    repo_root = _ensure_repo_root_on_path()
+    from manual_astar import (  # type: ignore[import-not-found]
+        GRID_RESOLUTION,
+        SAFETY_MARGIN,
+        astar_search,
+        build_occupancy_grid,
+        load_world,
+        validate_start_and_goal,
+    )
+
+    world = load_world(yaml_path)
+    grid = build_occupancy_grid(world, GRID_RESOLUTION, SAFETY_MARGIN)
+    start_cell, goal_cell = validate_start_and_goal(world, grid)
+
+    astar_path = astar_search(grid, start_cell, goal_cell)
+    dijkstra_path = astar_search(grid, start_cell, goal_cell, lambda *_: 0.0)
+
+    def _octile_cost(path: list[tuple[int, int]]) -> float:
+        total = 0.0
+        for (r0, c0), (r1, c1) in zip(path, path[1:]):
+            total += float(np.hypot(r1 - r0, c1 - c0))
+        return total
+
+    cost_astar = _octile_cost(astar_path)
+    cost_dijkstra = _octile_cost(dijkstra_path)
+    assert abs(cost_astar - cost_dijkstra) < 1e-9, (
+        f"TC29: Dijkstra path cost {cost_dijkstra} != A* path cost {cost_astar}; "
+        f"Dijkstra must recover the same optimal cost"
+    )
+
+    # Subprocess part: dijkstra_once must actually reach the goal through the runner.
+    seed_value = "29"
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        r = subprocess.run(
+            [
+                sys.executable, "-m", "runners.run_episode",
+                "--algorithm", "dijkstra_once",
+                "--seed", seed_value,
+                "--world", yaml_path,
+                "--no-traffic",
+                "--results-dir", td,
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert r.returncode == 0, (
+            f"TC29 dijkstra_once runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+        )
+        world_stem = Path(yaml_path).stem
+        json_path = Path(td) / world_stem / "dijkstra_once" / f"{seed_value}.json"
+        assert json_path.exists(), f"TC29: metrics JSON missing at {json_path}"
+        metrics = json.loads(json_path.read_text(encoding="utf-8"))
+        assert metrics["planner_error"] is None, f"TC29 planner_error not None: {metrics}"
+        assert metrics["time_to_goal"] is not None, (
+            f"TC29 dijkstra_once did not reach the goal (time_to_goal is None): {metrics}"
+        )
+
+
+def tc30(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """a_star_replan end-to-end through the runner: labeled dir, 8-key trace, runs to completion."""
+    repo_root = _ensure_repo_root_on_path()
+    seed_value = "30"
+    replan_k = "5"
+    world_stem = Path(yaml_path).stem
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        r = subprocess.run(
+            [
+                sys.executable, "-m", "runners.run_episode",
+                "--algorithm", "a_star_replan",
+                "--replan-k", replan_k,
+                "--seed", seed_value,
+                "--world", yaml_path,
+                "--traffic",  # default; stated explicitly
+                "--results-dir", td,
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert r.returncode == 0, (
+            f"TC30 a_star_replan runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+        )
+
+        out_dir = Path(td) / world_stem / "a_star_replan_k5"
+        json_path = out_dir / f"{seed_value}.json"
+        jsonl_path = out_dir / f"{seed_value}.trace.jsonl"
+        assert json_path.exists(), (
+            f"TC30: metrics JSON missing at {json_path} — label must be 'a_star_replan_k5'"
+        )
+        assert jsonl_path.exists(), f"TC30: trace JSONL missing at {jsonl_path}"
+
+        lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+        assert lines, "TC30: a_star_replan trace JSONL is empty"
+        for idx, raw in enumerate(lines):
+            rec = json.loads(raw)
+            assert isinstance(rec, dict), f"TC30: trace line {idx} is not an object"
+            assert "dynamic_obstacles_sha256" in rec, (
+                f"TC30: trace line {idx} missing dynamic_obstacles_sha256 with traffic on; "
+                f"keys={sorted(rec)}"
+            )
+            assert len(rec) == 8, (
+                f"TC30: trace line {idx} must have 8 keys with traffic on, got {len(rec)}: "
+                f"{sorted(rec)}"
+            )
+        # The episode may crash or time out — that is fine. We assert only that it RAN
+        # to completion (metrics written, no runner fault), not that it reached the goal.
+        metrics = json.loads(json_path.read_text(encoding="utf-8"))
+        assert metrics["planner_error"] is None, (
+            f"TC30: a_star_replan must plan successfully at t=0; planner_error={metrics['planner_error']}"
+        )
+
+
+def tc31(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure unit; synthesizes its own pose/lidar
+    """Replan cadence (every K-th act) + memoryless fold (no occupancy accumulation)."""
+    _ensure_repo_root_on_path()
+    import planners._grid as grid_module  # type: ignore[import-not-found]
+    from planners import build_controller  # type: ignore[import-not-found]
+    from planners._grid import (  # type: ignore[import-not-found]
+        lidar_to_occupancy as real_lidar_to_occupancy,
+        load_lidar_geometry,
+    )
+    from manual_astar import (  # type: ignore[import-not-found]
+        GRID_RESOLUTION,
+        SAFETY_MARGIN,
+        build_occupancy_grid,
+        load_world,
+    )
+
+    replan_k = 3
+    controller = build_controller("a_star_replan", replan_k)
+
+    # Synthesize a valid post-reset state0/lidar0 at the (2,2) start with an all-NaN
+    # scan — equivalent to a throwaway Arena's reset() for this lidar-only family.
+    state0 = np.array([2.0, 2.0, 0.0], dtype=np.float64)
+    nan_lidar = np.full((360,), np.nan, dtype=np.float64)
+    controller.reset(yaml_path, (), nan_lidar, state0)
+
+    # Count compute_path invocations via the instance method (the cadence gate).
+    call_indices: list[int] = []
+    original_compute_path = controller.compute_path
+
+    def counting_compute_path(state: np.ndarray, lidar: np.ndarray) -> Any:
+        call_indices.append(len(recorded_folds))  # marker; index filled by the fold spy
+        return original_compute_path(state, lidar)
+
+    # Record the occupancy each replan actually folds. compute_path reads the
+    # MODULE-level lidar_to_occupancy, so patch it there to capture the result.
+    recorded_folds: list[np.ndarray] = []
+
+    def spying_fold(static_cells, grid, state, lidar, geom, inflation):  # type: ignore[no-untyped-def]
+        folded = real_lidar_to_occupancy(static_cells, grid, state, lidar, geom, inflation)
+        recorded_folds.append(folded.copy())
+        return folded
+
+    # Two distinct lidar frames across the cadence window: frame_a carries an extra
+    # return (an obstacle present ONLY in the first replan), frame_b is empty.
+    world = load_world(yaml_path)
+    static_grid = build_occupancy_grid(world, GRID_RESOLUTION, SAFETY_MARGIN)
+    geom = load_lidar_geometry(yaml_path)
+    inflation = world.robot_radius + SAFETY_MARGIN
+
+    frame_a = np.full((360,), np.nan, dtype=np.float64)
+    frame_a[180] = 2.0  # beam ~+x: a finite return that adds cells beyond static
+    frame_b = np.full((360,), np.nan, dtype=np.float64)  # empty: no extra returns
+
+    controller.compute_path = counting_compute_path  # type: ignore[assignment]
+    grid_module.lidar_to_occupancy = spying_fold
+    try:
+        # 9 acts at K=3: replans fire on acts 3, 6, 9 only.
+        acts_per_frame = [frame_a, frame_a, frame_a, frame_b, frame_b, frame_b,
+                          frame_a, frame_a, frame_a]
+        fired_on: list[int] = []
+        for act_number, frame in enumerate(acts_per_frame, start=1):
+            before = len(recorded_folds)
+            controller.act(state0, frame)
+            if len(recorded_folds) > before:
+                fired_on.append(act_number)
+    finally:
+        grid_module.lidar_to_occupancy = real_lidar_to_occupancy
+        controller.compute_path = original_compute_path  # type: ignore[assignment]
+
+    assert fired_on == [3, 6, 9], (
+        f"TC31: compute_path must fire on acts 3, 6, 9 only (every K-th act), fired on {fired_on}"
+    )
+    assert len(recorded_folds) == 3, (
+        f"TC31: expected 3 recorded folds (one per replan), got {len(recorded_folds)}"
+    )
+
+    # Memoryless: each recorded fold equals static ∪ that-call's frame, with NO
+    # carry-over. The replan at act 3 folded frame_a (extra obstacle); the replan
+    # at act 6 folded frame_b (empty) and must equal the static grid exactly — the
+    # frame_a obstacle must NOT persist into it.
+    expected_a = real_lidar_to_occupancy(
+        static_grid.cells, static_grid, state0, frame_a, geom, inflation
+    )
+    expected_b = real_lidar_to_occupancy(
+        static_grid.cells, static_grid, state0, frame_b, geom, inflation
+    )
+    assert np.array_equal(recorded_folds[0], expected_a), (
+        "TC31: act-3 replan fold != static ∪ frame_a"
+    )
+    assert np.array_equal(recorded_folds[1], expected_b), (
+        "TC31: act-6 replan fold != static ∪ frame_b (frame_a obstacle leaked across replans)"
+    )
+    assert np.array_equal(recorded_folds[2], expected_a), (
+        "TC31: act-9 replan fold != static ∪ frame_a"
+    )
+    # The frame_a obstacle genuinely adds cells, so the memoryless check has teeth.
+    assert int(recorded_folds[0].sum()) > int(static_grid.cells.sum()), (
+        "TC31 setup: frame_a must add occupied cells beyond static"
+    )
+    assert np.array_equal(recorded_folds[1], static_grid.cells), (
+        "TC31: act-6 replan fold must equal the bare static grid (empty frame, no accumulation)"
+    )
+
+
+def tc32(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure unit; synthesizes its own pose/lidar
+    """Mid-replan failure fallback: act() swallows the error, keeps the SAME follower."""
+    _ensure_repo_root_on_path()
+    from planners import build_controller  # type: ignore[import-not-found]
+
+    controller = build_controller("a_star_replan", 1)  # replan on every act
+    state0 = np.array([2.0, 2.0, 0.0], dtype=np.float64)
+    nan_lidar = np.full((360,), np.nan, dtype=np.float64)
+    controller.reset(yaml_path, (), nan_lidar, state0)
+
+    good_follower = controller._follower
+    assert good_follower is not None, "TC32 setup: reset() must build a follower"
+
+    def raising_compute_path(state: np.ndarray, lidar: np.ndarray) -> Any:
+        raise RuntimeError("TC32 injected replan failure")
+
+    controller.compute_path = raising_compute_path  # type: ignore[assignment]
+    try:
+        action = controller.act(state0, nan_lidar)
+    except Exception as exc:  # noqa: BLE001 — the whole point is that nothing escapes
+        raise AssertionError(
+            f"TC32: a failed replan must not propagate out of act(); got "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+    assert isinstance(action, np.ndarray), (
+        f"TC32: act() must return an ndarray after a failed replan, got {type(action).__name__}"
+    )
+    assert action.shape == (2, 1), f"TC32: action shape must be (2, 1), got {action.shape}"
+    assert np.issubdtype(action.dtype, np.floating), (
+        f"TC32: action dtype must be float, got {action.dtype}"
+    )
+    assert np.all(np.isfinite(action)), "TC32: action must be finite after a failed replan"
+    assert controller._follower is good_follower, (
+        "TC32: a failed replan must KEEP the existing follower object, not rebuild it"
+    )
+
+    # Restore a working compute_path; the next replan must SWAP the follower.
+    del controller.compute_path  # restore the bound base-class method
+    controller.act(state0, nan_lidar)
+    assert controller._follower is not good_follower, (
+        "TC32: a successful replan must build a new follower (the swap path is live)"
+    )
+
+
+def tc33(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure unit; uses the registry only
+    """--replan-k validation + name==key invariant + algorithm_label + ALGORITHMS membership."""
+    _ensure_repo_root_on_path()
+    from planners import ALGORITHMS, algorithm_label, build_controller  # type: ignore[import-not-found]
+
+    # Invalid (algorithm, cadence) pairs must all raise ValueError.
+    invalid_pairs: list[tuple[str, Any]] = [
+        ("a_star_replan", None),     # replan family without a cadence
+        ("a_star_once", 5),          # once family with a forbidden cadence
+        ("dijkstra_replan", None),   # replan family without a cadence
+        ("d_star_lite", 5),          # non-replan family with a forbidden cadence
+    ]
+    for name, k in invalid_pairs:
+        try:
+            build_controller(name, k)
+        except ValueError:
+            continue
+        raise AssertionError(
+            f"TC33: build_controller({name!r}, {k!r}) must raise ValueError but did not"
+        )
+
+    # Valid combos construct, and the constructed controller's .name == its key (AC15).
+    valid_pairs: list[tuple[str, Any]] = [
+        ("a_star_once", None),
+        ("a_star_replan", 5),
+        ("dijkstra_once", None),
+        ("dijkstra_replan", 5),
+        ("d_star_lite", None),
+    ]
+    for name, k in valid_pairs:
+        controller = build_controller(name, k)
+        assert controller.name == name, (
+            f"TC33: build_controller({name!r}, {k!r}).name == {controller.name!r}, expected {name!r}"
+        )
+        assert name in ALGORITHMS, f"TC33: {name!r} must be a key in ALGORITHMS"
+
+    # Labels: replan families fold the cadence in, the rest use the bare key (AC6).
+    assert algorithm_label("a_star_replan", 5) == "a_star_replan_k5", (
+        f"TC33: algorithm_label('a_star_replan', 5) == "
+        f"{algorithm_label('a_star_replan', 5)!r}, expected 'a_star_replan_k5'"
+    )
+    assert algorithm_label("a_star_once", None) == "a_star_once", (
+        f"TC33: algorithm_label('a_star_once', None) == "
+        f"{algorithm_label('a_star_once', None)!r}, expected 'a_star_once'"
+    )
+
+
+def tc34(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """a_star_once parity through the redesigned loop: reaches goal + byte-identical traces."""
+    repo_root = _ensure_repo_root_on_path()
+    seed_value = "34"
+    world_stem = Path(yaml_path).stem
+    runner_args = [
+        sys.executable, "-m", "runners.run_episode",
+        "--algorithm", "a_star_once",
+        "--seed", seed_value,
+        "--world", yaml_path,
+        "--no-traffic",
+    ]
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_a, \
+            tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td_b:
+        for td in (td_a, td_b):
+            r = subprocess.run(
+                [*runner_args, "--results-dir", td],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            assert r.returncode == 0, (
+                f"TC34 a_star_once runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+            )
+
+        json_a = Path(td_a) / world_stem / "a_star_once" / f"{seed_value}.json"
+        json_b = Path(td_b) / world_stem / "a_star_once" / f"{seed_value}.json"
+        jsonl_a = Path(td_a) / world_stem / "a_star_once" / f"{seed_value}.trace.jsonl"
+        jsonl_b = Path(td_b) / world_stem / "a_star_once" / f"{seed_value}.trace.jsonl"
+        for p in (json_a, json_b, jsonl_a, jsonl_b):
+            assert p.exists(), f"TC34: expected output missing at {p}"
+
+        for json_path in (json_a, json_b):
+            metrics = json.loads(json_path.read_text(encoding="utf-8"))
+            assert metrics["planner_error"] is None, (
+                f"TC34 planner_error not None at {json_path}: {metrics}"
+            )
+            assert metrics["time_to_goal"] is not None, (
+                f"TC34 a_star_once did not reach the goal at {json_path}: {metrics}"
+            )
+
+        assert filecmp.cmp(str(jsonl_a), str(jsonl_b), shallow=False), (
+            "TC34: two same-seed a_star_once --no-traffic runs produced differing trace JSONL; "
+            "the runner redesign regressed the shipped a_star_once determinism path"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TC35..TC37 — Group B: the incremental D* Lite family (d_star_lite). TC35/TC36
+# are in-process unit cases over the search core (TC35 also shells out for the
+# static-map drive); TC36 is the BINDING incremental==from-scratch proof; TC37
+# mixes a pure-registry check with two subprocess drives (forbidden --replan-k +
+# the slow traffic-ON end-to-end). All in-process imports need the repo root on
+# sys.path, so reuse the tc28-tc34 helper.
+# ---------------------------------------------------------------------------
+
+
+def _octile_path_cost(path: list[tuple[int, int]]) -> float:
+    """Octile cost of a cell path: Σ hypot(Δrow, Δcol) over consecutive cells.
+
+    Identical metric to TC29's `_octile_cost` — both `astar_search` and
+    `DStarLiteSearch` charge `np.hypot(dr, dc)` per step (1.0 orthogonal,
+    sqrt(2) diagonal), so this is the common cost model all Group-B cost
+    comparisons reduce to.
+    """
+    total = 0.0
+    for (row0, col0), (row1, col1) in zip(path, path[1:]):
+        total += float(np.hypot(row1 - row0, col1 - col0))
+    return total
+
+
+def tc35(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """D* Lite optimal static path (== A* cost, collision-free) + reaches goal via runner."""
+    repo_root = _ensure_repo_root_on_path()
+    from manual_astar import (  # type: ignore[import-not-found]
+        GRID_RESOLUTION,
+        SAFETY_MARGIN,
+        astar_search,
+        build_occupancy_grid,
+        load_world,
+        validate_start_and_goal,
+    )
+    from planners.d_star_lite import DStarLiteSearch  # type: ignore[import-not-found]
+
+    # --- Unit part: D* Lite over the arena_v1 STATIC grid (the controller's t=0
+    # substrate when traffic is off) must produce a path of the SAME optimal
+    # octile cost A* does, since both share the cost model. ---
+    world = load_world(yaml_path)
+    grid = build_occupancy_grid(world, GRID_RESOLUTION, SAFETY_MARGIN)
+    start_cell, goal_cell = validate_start_and_goal(world, grid)
+
+    astar_path = astar_search(grid, start_cell, goal_cell)
+    astar_cost = _octile_path_cost(astar_path)
+
+    search = DStarLiteSearch(grid.cells, start_cell, goal_cell)
+    search.compute_shortest_path()
+    dstar_path = search.extract_path()
+    dstar_cost = _octile_path_cost(dstar_path)
+
+    assert abs(astar_cost - dstar_cost) < 1e-9, (
+        f"TC35: D* Lite static cost {dstar_cost} != A* cost {astar_cost}; "
+        f"D* Lite must recover the same optimal cost"
+    )
+    assert dstar_path[0] == start_cell and dstar_path[-1] == goal_cell, (
+        f"TC35: D* Lite path must run {start_cell} -> {goal_cell}, "
+        f"got {dstar_path[0]} -> {dstar_path[-1]}"
+    )
+    # Clearance: every cell on the extracted grid path is unoccupied (the path is
+    # collision-free on the static grid).
+    for cell in dstar_path:
+        assert not bool(grid.cells[cell]), (
+            f"TC35: D* Lite path traverses an occupied cell {cell}"
+        )
+
+    # --- Subprocess part: d_star_lite must reach the goal on the static map. ---
+    # D* Lite runs its full incremental search every tick, so even the no-traffic
+    # drive is far more CPU-heavy per step than the A* _once runners — under the
+    # contention of a full --check pass an 812-step traversal can blow a 300 s
+    # budget. Give it the same 600 s timeout TC37's traffic drive uses.
+    seed_value = "35"
+    world_stem = Path(yaml_path).stem
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        r = subprocess.run(
+            [
+                sys.executable, "-m", "runners.run_episode",
+                "--algorithm", "d_star_lite",
+                "--seed", seed_value,
+                "--world", yaml_path,
+                "--no-traffic",
+                "--results-dir", td,
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert r.returncode == 0, (
+            f"TC35 d_star_lite runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+        )
+        json_path = Path(td) / world_stem / "d_star_lite" / f"{seed_value}.json"
+        assert json_path.exists(), f"TC35: metrics JSON missing at {json_path}"
+        metrics = json.loads(json_path.read_text(encoding="utf-8"))
+        assert metrics["planner_error"] is None, (
+            f"TC35 planner_error not None: {metrics}"
+        )
+        assert metrics["time_to_goal"] is not None, (
+            f"TC35 d_star_lite did not reach the goal on the static map "
+            f"(time_to_goal is None): {metrics}"
+        )
+
+
+def tc36(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure unit; hand-built grid
+    """D* Lite incremental update == from-scratch A* (BINDING): blocking the path lengthens it.
+
+    Hand-built 9x9 grid: a vertical wall at col 4 spanning rows 0..6 leaves a single
+    passage at cell C=(7, 4). The unique optimal (0,0)->(8,8) path threads C. Blocking
+    C forces a strictly costlier detour around the wall's bottom, so the incremental
+    update MUST bind: a no-op/ignored update would leave the cheaper pre-block cost in
+    place and fail the strict-increase assertion. We compare octile COST only (not the
+    exact cell set), per AC10's equal-cost tie-break allowance.
+    """
+    _ensure_repo_root_on_path()
+    from manual_astar import OccupancyGrid, astar_search  # type: ignore[import-not-found]
+    from planners.d_star_lite import DStarLiteSearch  # type: ignore[import-not-found]
+
+    rows, cols = 9, 9
+    start_cell = (0, 0)
+    goal_cell = (8, 8)
+    block_cell = (7, 4)
+
+    def build_grid() -> np.ndarray:
+        cells = np.zeros((rows, cols), dtype=np.bool_)
+        for row in range(0, 7):
+            cells[row, 4] = True  # vertical wall, gap at row 7 (=> passage at C)
+        return cells
+
+    # (a) Pre-block: compute the optimal path and assert it traverses C.
+    cells = build_grid()
+    assert not bool(cells[block_cell]), "TC36 setup: C must start free"
+    search = DStarLiteSearch(cells, start_cell, goal_cell)
+    search.compute_shortest_path()
+    pre_path = search.extract_path()
+    pre_cost = _octile_path_cost(pre_path)
+    assert block_cell in pre_path, (
+        f"TC36 precondition: optimal pre-block path must traverse C={block_cell}; "
+        f"got {pre_path}"
+    )
+
+    # (b)/(c) Block C in the SAME array the search references (it holds a reference,
+    # not a copy), report the flip, and re-solve incrementally.
+    cells[block_cell] = True
+    search.update_cells([block_cell])
+    search.compute_shortest_path()
+    post_path = search.extract_path()
+    post_cost = _octile_path_cost(post_path)
+
+    # Oracle: a FRESH A* on the updated grid, built from the same astar_search so the
+    # cost model matches exactly.
+    oracle_grid = OccupancyGrid(
+        cells=cells.copy(),
+        resolution=1.0,
+        offset=np.array([0.0, 0.0], dtype=float),
+    )
+    oracle_path = astar_search(oracle_grid, start_cell, goal_cell)
+    oracle_cost = _octile_path_cost(oracle_path)
+
+    assert abs(post_cost - oracle_cost) < 1e-9, (
+        f"TC36: incremental post-update cost {post_cost} != fresh-A* oracle cost "
+        f"{oracle_cost}; the incremental repair diverged from from-scratch"
+    )
+    # The block must BIND: an ignored/no-op update would leave the cheaper pre-block
+    # cost in place, so the strict increase is the load-bearing assertion.
+    assert post_cost > pre_cost + 1e-9, (
+        f"TC36: blocking C did not lengthen the optimum (post {post_cost} <= pre "
+        f"{pre_cost}); the update was a no-op — incremental edge repair is broken"
+    )
+    assert post_path[0] == start_cell and post_path[-1] == goal_cell, (
+        f"TC36: post-update path must still run {start_cell} -> {goal_cell}, "
+        f"got {post_path[0]} -> {post_path[-1]}"
+    )
+    assert block_cell not in post_path, (
+        f"TC36: post-update path must route AROUND the now-blocked C={block_cell}; "
+        f"got {post_path}"
+    )
+
+
+def tc37(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — uses its own internal seed
+    """d_star_lite registered + rejects --replan-k + traffic-ON end-to-end (8-key trace).
+
+    NOTE: the traffic drive is the SLOWEST single TC (~1-3 min): d_star_lite dodges and
+    reaches the goal under traffic, replanning every step over ~800 steps. The generous
+    timeout below is intentional; mirror TC30's subprocess pattern.
+    """
+    repo_root = _ensure_repo_root_on_path()
+    from planners import ALGORITHMS, build_controller  # type: ignore[import-not-found]
+
+    # --- Registration: the controller module registered itself at import. ---
+    assert "d_star_lite" in ALGORITHMS, "TC37: 'd_star_lite' must be a key in ALGORITHMS"
+    controller = build_controller("d_star_lite", None)
+    assert controller.name == "d_star_lite", (
+        f"TC37: build_controller('d_star_lite', None).name == {controller.name!r}, "
+        f"expected 'd_star_lite'"
+    )
+
+    # --- d_star_lite is NOT a REPLAN family: a --replan-k must be rejected. ---
+    try:
+        build_controller("d_star_lite", 5)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(
+            "TC37: build_controller('d_star_lite', 5) must raise ValueError "
+            "(d_star_lite is not a REPLAN family)"
+        )
+
+    seed_value = "37"
+    world_stem = Path(yaml_path).stem
+
+    # A forbidden --replan-k through the runner must be a config error (exit 2).
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        r_bad = subprocess.run(
+            [
+                sys.executable, "-m", "runners.run_episode",
+                "--algorithm", "d_star_lite",
+                "--replan-k", "5",
+                "--seed", seed_value,
+                "--world", yaml_path,
+                "--no-traffic",
+                "--results-dir", td,
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert r_bad.returncode == 2, (
+            f"TC37: forbidden --replan-k must exit 2, got {r_bad.returncode}; "
+            f"stderr={r_bad.stderr[-400:]}"
+        )
+
+    # --- Traffic e2e: d_star_lite dodges and reaches the goal under traffic; every
+    # trace line must carry the 8th dynamic_obstacles_sha256 key. This is the slowest
+    # single TC — replans every step over a full ~800-step traversal. ---
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        r = subprocess.run(
+            [
+                sys.executable, "-m", "runners.run_episode",
+                "--algorithm", "d_star_lite",
+                "--seed", seed_value,
+                "--world", yaml_path,
+                "--traffic",  # default; stated explicitly
+                "--results-dir", td,
+            ],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        assert r.returncode == 0, (
+            f"TC37 d_star_lite traffic runner exit {r.returncode}; stderr={r.stderr[-400:]}"
+        )
+
+        out_dir = Path(td) / world_stem / "d_star_lite"
+        json_path = out_dir / f"{seed_value}.json"
+        jsonl_path = out_dir / f"{seed_value}.trace.jsonl"
+        assert json_path.exists(), f"TC37: metrics JSON missing at {json_path}"
+        assert jsonl_path.exists(), f"TC37: trace JSONL missing at {jsonl_path}"
+
+        # The episode RAN to completion (no runner fault): t=0 planning succeeded.
+        metrics = json.loads(json_path.read_text(encoding="utf-8"))
+        assert metrics["planner_error"] is None, (
+            f"TC37: d_star_lite must plan successfully at t=0; "
+            f"planner_error={metrics['planner_error']}"
+        )
+
+        lines = jsonl_path.read_text(encoding="utf-8").splitlines()
+        assert lines, "TC37: d_star_lite traffic trace JSONL is empty"
+        for idx, raw in enumerate(lines):
+            rec = json.loads(raw)
+            assert isinstance(rec, dict), f"TC37: trace line {idx} is not an object"
+            assert "dynamic_obstacles_sha256" in rec, (
+                f"TC37: trace line {idx} missing dynamic_obstacles_sha256 with traffic on; "
+                f"keys={sorted(rec)}"
+            )
+            assert len(rec) == 8, (
+                f"TC37: trace line {idx} must have 8 keys with traffic on, got {len(rec)}: "
+                f"{sorted(rec)}"
+            )
+
+
+# ---------------------------------------------------------------------------
 # CLI runner — --check (default) or --render. See module docstring above.
 # ---------------------------------------------------------------------------
 
@@ -1457,6 +2215,16 @@ def _run_checks(yaml_path: str, seed: int) -> int:
         ("TC25: Phase 3 seed derivation (determinism/uniqueness/prefix)", tc25),
         ("TC26: Phase 3 batch determinism + parallel-ordering", tc26),
         ("TC27: Phase 3 failure accounting + non-zero batch exit", tc27),
+        ("TC28: lidar->grid fold geometry (pose-dependent, memoryless)", tc28),
+        ("TC29: Dijkstra == A* optimal cost + dijkstra_once reaches goal", tc29),
+        ("TC30: a_star_replan end-to-end + labeled dir + 8-key trace", tc30),
+        ("TC31: replan cadence (every K-th act) + memoryless fold", tc31),
+        ("TC32: mid-replan failure fallback + follower identity", tc32),
+        ("TC33: --replan-k validation + name==key + label + membership", tc33),
+        ("TC34: a_star_once parity through the new loop (determinism)", tc34),
+        ("TC35: D* Lite optimal static path (== A* cost) + reaches goal", tc35),
+        ("TC36: D* Lite incremental == from-scratch (binding block)", tc36),
+        ("TC37: d_star_lite registered + rejects --replan-k + traffic e2e", tc37),
     ]
     failures = 0
     for label, fn in cases:
@@ -1499,7 +2267,7 @@ def _parse_args() -> argparse.Namespace:
     group.add_argument(
         "--check",
         action="store_true",
-        help="Run TC1-TC27 headless (28 cases, incl. Phase 2 traffic + Phase 3 batch runner)",
+        help="Run TC1-TC37 headless (38 cases, incl. Phase 2 traffic + Phase 3 batch runner + replanning + D* Lite families)",
     )
     return parser.parse_args()
 
