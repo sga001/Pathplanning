@@ -889,24 +889,555 @@ def _chart_a4(results: WorldResults, plt, out_dir: Path) -> Path:
     return out_path
 
 
+def _success_times_by_seed(summary: AlgoSummary) -> dict[int, float]:
+    """Reconstruct the per-seed success time_to_goal for one algorithm.
+
+    The loader exposes `per_seed` (seed -> outcome) and a flat `times` tuple of
+    success times, but no direct seed -> time map. `times` is appended in the
+    SAME iteration order the loader scanned files — `sorted(label_dir.glob(...))`
+    — which for `<seed>.json` files in one dir is lexicographic by filename. So
+    re-sorting this algorithm's success seeds by their `"<seed>.json"` filename
+    and zipping with `times` recovers the original mapping exactly.
+
+    On any length mismatch (defensive — should not happen with loader output) the
+    shorter of the two is zipped, so a malformed summary degrades to a partial
+    map rather than raising.
+    """
+    success_seeds = [seed for seed, outcome in summary.per_seed.items() if outcome == "success"]
+    ordered_seeds = sorted(success_seeds, key=lambda seed: f"{seed}.json")
+    return {seed: time for seed, time in zip(ordered_seeds, summary.times)}
+
+
+# Failure outcomes overlaid as flat categorical cells in the B1 heatmap (success
+# is the continuous-cmap layer, so it is excluded here).
+_B1_FAILURE_OUTCOMES = ("crash", "timeout", "planner_error")
+
+
 def _chart_b1(results: WorldResults, plt, out_dir: Path) -> Path:
-    """B1 — (T3) per-seed outcome heatmap (rows = algorithms, cols = seed_order)."""
-    raise NotImplementedError("chart b1 is implemented in T3")
+    """B1 — seed-difficulty heatmap: rows = algorithms (CANONICAL order), columns = the shared seed stream (AC7).
+
+    Every row aligns to the same `results.seed_order` column order (a manifest's
+    `derived_seeds`, else sorted stems), so reading down a column exposes
+    universally-hard seeds. A SUCCESS cell is shaded by its time_to_goal on a
+    continuous viridis colormap (colorbar "time to goal (s)"); a FAILURE cell is a
+    flat categorical color per type (crash / timeout / planner_error, reusing
+    OUTCOME_COLORS for parity with A3); an absent cell (no entry for that seed)
+    keeps a neutral background. Never raises on missing seeds or 0-success rows.
+    """
+    import numpy as np
+
+    summaries = results.summaries
+    seed_order = results.seed_order
+    n_rows = len(summaries)
+    n_cols = len(seed_order)
+
+    # Column index for each seed in the shared stream (first occurrence wins if a
+    # manifest ever repeated a seed).
+    col_of_seed: dict[int, int] = {}
+    for col, seed in enumerate(seed_order):
+        if seed not in col_of_seed:
+            col_of_seed[seed] = col
+
+    # Continuous layer: success times (NaN everywhere else so imshow renders the
+    # bad/NaN color for non-success and absent cells).
+    success_matrix = np.full((n_rows, max(n_cols, 1)), np.nan, dtype=float)
+    # Categorical overlay: list of (row, col, color) for each failure cell.
+    failure_cells: list[tuple[int, int, str]] = []
+
+    for row, summary in enumerate(summaries):
+        seed_times = _success_times_by_seed(summary)
+        for seed, outcome in summary.per_seed.items():
+            col = col_of_seed.get(seed)
+            if col is None:
+                # Seed not in the shared column order (e.g. a stray stem absent
+                # from the manifest stream); skip rather than widen the matrix.
+                continue
+            if outcome == "success":
+                time_value = seed_times.get(seed)
+                if time_value is not None:
+                    success_matrix[row, col] = time_value
+            elif outcome in _B1_FAILURE_OUTCOMES:
+                failure_cells.append((row, col, OUTCOME_COLORS[outcome]))
+
+    fig, ax = plt.subplots(figsize=(max(12.0, 0.22 * max(n_cols, 1) + 4.0), 8))
+
+    neutral_bg = "#eaeaea"
+    cmap = plt.get_cmap("viridis").copy()
+    cmap.set_bad(neutral_bg)   # NaN cells (non-success / absent) render neutral
+
+    # Color limits from the finite success times only; guard the all-NaN case.
+    finite_times = success_matrix[np.isfinite(success_matrix)]
+    if finite_times.size > 0:
+        vmin = float(finite_times.min())
+        vmax = float(finite_times.max())
+        if vmin == vmax:
+            vmax = vmin + 1.0   # avoid a degenerate colorbar on a single time value
+    else:
+        vmin, vmax = 0.0, 1.0
+
+    image = ax.imshow(
+        success_matrix,
+        aspect="auto",
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
+        interpolation="none",
+        origin="upper",
+    )
+
+    # Overlay each failure cell as a flat-colored unit rectangle. imshow centres
+    # cell (row, col) on integer coords, so the patch spans [col-0.5, col+0.5].
+    from matplotlib.patches import Rectangle
+
+    for row, col, color in failure_cells:
+        ax.add_patch(
+            Rectangle(
+                (col - 0.5, row - 0.5),
+                1.0,
+                1.0,
+                facecolor=color,
+                edgecolor="none",
+                zorder=3,
+            )
+        )
+
+    # Colorbar for the success layer.
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.025, pad=0.12)
+    colorbar.set_label("time to goal (s)")
+
+    # Y ticks = algorithm display names, one per row.
+    ax.set_yticks(range(n_rows))
+    ax.set_yticklabels([summary.display for summary in summaries], fontsize=9)
+
+    # X ticks = seed-column index, labelled sparsely (50 raw 64-bit seeds are far
+    # too dense to print). Show at most ~12 ticks across the stream.
+    if n_cols > 0:
+        max_ticks = 12
+        stride = max(1, n_cols // max_ticks)
+        tick_cols = list(range(0, n_cols, stride))
+        ax.set_xticks(tick_cols)
+        ax.set_xticklabels([str(col) for col in tick_cols], fontsize=8)
+    else:
+        ax.set_xticks([])
+    ax.set_xlabel("seed column (shared stream index)")
+
+    order_source = "manifest derived_seeds" if results.manifest_seed_order else "sorted stems (no manifest)"
+    ax.set_title(f"B1 - seed-difficulty heatmap (column order: {order_source})")
+
+    # Legend mapping the 3 failure colors to their outcome labels, beside the bar.
+    failure_handles = [
+        plt.Line2D(
+            [0], [0],
+            marker="s",
+            linestyle="none",
+            markerfacecolor=OUTCOME_COLORS[outcome],
+            markeredgecolor="none",
+            markersize=10,
+            label=OUTCOME_DISPLAY[outcome],
+        )
+        for outcome in _B1_FAILURE_OUTCOMES
+    ]
+    failure_handles.append(
+        plt.Line2D(
+            [0], [0],
+            marker="s",
+            linestyle="none",
+            markerfacecolor=neutral_bg,
+            markeredgecolor="#999999",
+            markersize=10,
+            label="absent (no entry)",
+        )
+    )
+    ax.legend(
+        handles=failure_handles,
+        title="failure / absent",
+        loc="upper left",
+        bbox_to_anchor=(1.14, 1.0),
+        fontsize=8,
+        title_fontsize=9,
+        borderaxespad=0.0,
+    )
+
+    fig.tight_layout()
+    out_path = out_dir / "b1_seed_heatmap.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
 
 
 def _chart_b2(results: WorldResults, plt, out_dir: Path) -> Path:
-    """B2 — (T3) failure-rate comparison across algorithms."""
-    raise NotImplementedError("chart b2 is implemented in T3")
+    """B2 — path-length box per algorithm over successful episodes, sorted by median ascending (AC8).
+
+    One box per algorithm of its `path_lengths` over SUCCESSFUL episodes, sorted
+    by median path length ascending. Mirrors A4's degenerate handling: 0
+    successes -> annotate "no success"; exactly 1 -> scatter the lone point. A
+    horizontal reference line marks the Euclidean lower bound, labelled so it is
+    not read as an achievable target. Never raises on the degenerate cases.
+    """
+    color_map = _algorithm_color_map(results.summaries, plt)
+
+    def _median_path(summary: AlgoSummary) -> float:
+        return statistics.median(summary.path_lengths) if summary.path_lengths else float("inf")
+
+    # Algorithms with >=1 success sort first by ascending median path length; the
+    # zero-success ones trail (inf median) in CANONICAL order.
+    def _sort_key(summary: AlgoSummary):
+        has_path = len(summary.path_lengths) > 0
+        return (0 if has_path else 1, _median_path(summary))
+
+    ordered = sorted(results.summaries, key=_sort_key)
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    positions = list(range(1, len(ordered) + 1))
+    box_data: list[list[float]] = []
+    box_positions: list[int] = []
+
+    for position, summary in zip(positions, ordered):
+        path_lengths = summary.path_lengths
+        color = color_map[summary.label]
+        if len(path_lengths) >= 2:
+            box_data.append(list(path_lengths))
+            box_positions.append(position)
+        elif len(path_lengths) == 1:
+            ax.scatter(
+                [position],
+                [path_lengths[0]],
+                color=color,
+                s=40,
+                edgecolors="black",
+                linewidths=0.8,
+                zorder=4,
+            )
+            ax.annotate(
+                "n=1",
+                xy=(position, path_lengths[0]),
+                xytext=(0, 6),
+                textcoords="offset points",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color=color,
+                zorder=5,
+            )
+        else:
+            ax.annotate(
+                "no success",
+                xy=(position, 0.02),
+                xycoords=("data", "axes fraction"),
+                ha="center",
+                va="bottom",
+                rotation=90,
+                fontsize=8,
+                color="#999999",
+                fontweight="bold",
+                zorder=5,
+            )
+
+    if box_data:
+        boxes = ax.boxplot(
+            box_data,
+            positions=box_positions,
+            widths=0.6,
+            patch_artist=True,
+            showfliers=True,
+            flierprops=dict(marker="o", markersize=3, markerfacecolor="#555555", markeredgecolor="none", alpha=0.5),
+            medianprops=dict(color="black", linewidth=1.4),
+        )
+        boxed_summaries = [summary for summary in ordered if len(summary.path_lengths) >= 2]
+        for patch, summary in zip(boxes["boxes"], boxed_summaries):
+            patch.set_facecolor(color_map[summary.label])
+            patch.set_alpha(0.6)
+
+    # Euclidean lower bound reference line, labelled as unreachable.
+    ax.axhline(
+        STRAIGHT_LINE_IDEAL_M,
+        color="#444444",
+        linestyle="--",
+        linewidth=1.2,
+        zorder=1,
+    )
+    ax.annotate(
+        f"Euclidean lower bound (unreachable through walls) = {STRAIGHT_LINE_IDEAL_M:.2f} m",
+        xy=(0.01, STRAIGHT_LINE_IDEAL_M),
+        xycoords=("axes fraction", "data"),
+        xytext=(0, 4),
+        textcoords="offset points",
+        ha="left",
+        va="bottom",
+        fontsize=8,
+        color="#444444",
+        fontweight="bold",
+        zorder=5,
+    )
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels(
+        [summary.display for summary in ordered],
+        rotation=45,
+        ha="right",
+        fontsize=9,
+    )
+    ax.set_ylabel("path length (m)")
+    ax.set_title("B2 - path-length distribution per algorithm (sorted by median, shortest left)")
+    ax.set_axisbelow(True)
+    ax.grid(True, axis="y", linestyle=":", alpha=0.4)
+
+    fig.tight_layout()
+    out_path = out_dir / "b2_pathlen_box.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
 
 
 def _chart_b3(results: WorldResults, plt, out_dir: Path) -> Path:
-    """B3 — (T3) wallclock-per-step comparison (from the __wallclock__ subtree)."""
-    raise NotImplementedError("chart b3 is implemented in T3")
+    """B3 — compute-cost bars: mean wallclock_per_step per algorithm, sorted ascending (AC9).
+
+    One bar per algorithm = mean `wallclock_per_step`, sourced from the
+    `wallclocks` the loader populated from the `__wallclock__` subtree. The
+    figure footnote states the source AND its --jobs sensitivity: if ANY
+    algorithm's samples came from that dedicated serial subtree
+    (`wallclock_from_subtree` True) the footnote credits the "serial --jobs 1
+    pass"; otherwise (the subtree was absent for every algorithm) it caveats that
+    the numbers are from the parallel bulk pass and are perturbed by --jobs
+    contention. Algorithms with no wallclock samples are annotated "no data" and
+    get no bar. Never raises.
+    """
+    color_map = _algorithm_color_map(results.summaries, plt)
+
+    # Mean wallclock per algorithm; None where there are no samples.
+    means: list[tuple[AlgoSummary, float | None]] = []
+    for summary in results.summaries:
+        mean_wallclock = statistics.fmean(summary.wallclocks) if summary.wallclocks else None
+        means.append((summary, mean_wallclock))
+
+    # Sort: algorithms WITH samples first by ascending mean, no-data ones trail in
+    # CANONICAL order.
+    def _sort_key(item: tuple[AlgoSummary, float | None]):
+        _summary, mean_wallclock = item
+        if mean_wallclock is None:
+            return (1, float("inf"))
+        return (0, mean_wallclock)
+
+    ordered = sorted(means, key=_sort_key)
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    positions = list(range(len(ordered)))
+    for position, (summary, mean_wallclock) in zip(positions, ordered):
+        if mean_wallclock is None:
+            ax.annotate(
+                "no data",
+                xy=(position, 0.02),
+                xycoords=("data", "axes fraction"),
+                ha="center",
+                va="bottom",
+                rotation=90,
+                fontsize=8,
+                color="#999999",
+                fontweight="bold",
+                zorder=5,
+            )
+            continue
+        ax.bar(
+            position,
+            mean_wallclock,
+            color=color_map[summary.label],
+            edgecolor="white",
+            linewidth=0.4,
+            zorder=2,
+        )
+
+    # Footnote source: serial subtree if ANY algorithm drew from it, else the
+    # bulk-pass caveat. Either way the footnote names the --jobs sensitivity (AC9).
+    any_subtree = any(summary.wallclock_from_subtree for summary in results.summaries)
+    if any_subtree:
+        footnote = (
+            "wallclock from serial --jobs 1 pass (__wallclock__ subtree); "
+            "wallclock_per_step is --jobs-sensitive, so these serial numbers are the headline values."
+        )
+    else:
+        footnote = (
+            "wallclock from parallel bulk pass - perturbed by --jobs contention; approximate. "
+            "wallclock_per_step is --jobs-sensitive; rerun the serial __wallclock__ pass for headline numbers."
+        )
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels(
+        [summary.display for summary, _ in ordered],
+        rotation=45,
+        ha="right",
+        fontsize=9,
+    )
+    ax.set_ylabel("mean wallclock per step (s)")
+    ax.set_title("B3 - compute cost per step per algorithm (sorted by mean, cheapest left)")
+    ax.set_axisbelow(True)
+    ax.grid(True, axis="y", linestyle=":", alpha=0.4)
+    fig.text(0.01, 0.01, footnote, fontsize=8, color="#555555", ha="left", va="bottom", style="italic")
+
+    fig.tight_layout(rect=(0.0, 0.04, 1.0, 1.0))
+    out_path = out_dir / "b3_compute_bars.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
 
 
 def _chart_b4(results: WorldResults, plt, out_dir: Path) -> Path:
-    """B4 — (T3) speed/efficiency scatter across algorithms."""
-    raise NotImplementedError("chart b4 is implemented in T3")
+    """B4 — family-contrast panels isolating the three designed experiments (AC10).
+
+    Small-multiple subplots, each a grouped-bar comparison of failure_rate (left
+    axis) and median time (right axis) for a designed contrast:
+      1. A* vs Dijkstra (the heuristic question).
+      2. once vs replan within each family that has both (the replanning question).
+      3. reactive vs global (the reactivity question).
+    NaN medians (0-success algorithms) are drawn as a 0-height median bar and
+    annotated "no median (0 success)" so they read as missing, not fast. Never
+    raises when an algorithm is absent (it is simply skipped from its panel).
+    """
+    by_label = {summary.label: summary for summary in results.summaries}
+
+    # The panels reference algorithms by their registry name; map each to the
+    # loader's actual label (which folds in --replan-k) so a CLI K other than the
+    # CANONICAL placeholder still resolves. The label order in CANONICAL is the
+    # same order the loader produced `summaries`, so name -> label is by position.
+    name_to_label = {name: summary.label for (name, *_), summary in zip(CANONICAL, results.summaries)}
+
+    def _summary_for(name: str) -> AlgoSummary | None:
+        label = name_to_label.get(name)
+        if label is None:
+            return None
+        return by_label.get(label)
+
+    # Each panel is (title, [algorithm registry names in display order]).
+    panels: list[tuple[str, list[str]]] = [
+        (
+            "heuristic: A* vs Dijkstra",
+            ["a_star_once", "dijkstra_once", "a_star_replan", "dijkstra_replan"],
+        ),
+        (
+            "replanning: once vs replan",
+            [
+                "a_star_once", "a_star_replan",
+                "dijkstra_once", "dijkstra_replan",
+                "rrt_once", "rrt_replan",
+                "rrt_star_once", "rrt_star_replan",
+            ],
+        ),
+        (
+            "reactivity: reactive vs global",
+            ["dwa", "apf", "d_star_lite", "a_star_replan"],
+        ),
+    ]
+
+    import numpy as np
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(6.2 * len(panels), 6.5))
+    if len(panels) == 1:
+        axes = [axes]
+
+    failure_color = OUTCOME_COLORS["crash"]   # red bar = failure_rate
+    median_color = "#1f77b4"                  # blue bar = median time
+
+    for ax_left, (title, names) in zip(axes, panels):
+        # Keep only the algorithms present in this world; skip absent ones.
+        present = [(name, _summary_for(name)) for name in names]
+        present = [(name, summary) for name, summary in present if summary is not None and summary.n_present > 0]
+
+        ax_right = ax_left.twinx()
+
+        if not present:
+            ax_left.annotate(
+                "no data",
+                xy=(0.5, 0.5),
+                xycoords="axes fraction",
+                ha="center",
+                va="center",
+                fontsize=11,
+                color="#999999",
+                fontweight="bold",
+            )
+            ax_left.set_title(title, fontsize=11)
+            ax_left.set_xticks([])
+            continue
+
+        indices = np.arange(len(present))
+        bar_half = 0.2
+
+        failure_rates = [
+            summary.failure_rate if summary.failure_rate == summary.failure_rate else 0.0
+            for _name, summary in present
+        ]
+        ax_left.bar(
+            indices - bar_half,
+            failure_rates,
+            width=2 * bar_half,
+            color=failure_color,
+            edgecolor="white",
+            linewidth=0.4,
+            label="failure rate",
+            zorder=2,
+        )
+
+        # Median time: NaN (0-success) -> draw nothing, annotate instead.
+        median_heights = []
+        for offset, (_name, summary) in zip(indices, present):
+            median = summary.median_time
+            if median == median:   # finite
+                ax_right.bar(
+                    offset + bar_half,
+                    median,
+                    width=2 * bar_half,
+                    color=median_color,
+                    edgecolor="white",
+                    linewidth=0.4,
+                    label="median time",
+                    zorder=2,
+                )
+                median_heights.append(median)
+            else:
+                ax_right.annotate(
+                    "no median\n(0 success)",
+                    xy=(offset + bar_half, 0.0),
+                    xytext=(0, 4),
+                    textcoords="offset points",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                    color="#777777",
+                    zorder=5,
+                )
+
+        ax_left.set_xticks(indices)
+        ax_left.set_xticklabels(
+            [summary.display for _name, summary in present],
+            rotation=30,
+            ha="right",
+            fontsize=8,
+        )
+        ax_left.set_ylim(0.0, 1.05)
+        ax_left.set_ylabel("failure rate", color=failure_color)
+        ax_left.tick_params(axis="y", labelcolor=failure_color)
+        ax_right.set_ylabel("median time to goal (s)", color=median_color)
+        ax_right.tick_params(axis="y", labelcolor=median_color)
+        if median_heights:
+            ax_right.set_ylim(0.0, 1.15 * max(median_heights))
+        ax_left.set_title(title, fontsize=11)
+        ax_left.set_axisbelow(True)
+        ax_left.grid(True, axis="y", linestyle=":", alpha=0.3)
+
+    # One shared legend for the two bar series (colors are identical per panel).
+    legend_handles = [
+        plt.Line2D([0], [0], marker="s", linestyle="none", markerfacecolor=failure_color, markeredgecolor="none", markersize=10, label="failure rate (left axis)"),
+        plt.Line2D([0], [0], marker="s", linestyle="none", markerfacecolor=median_color, markeredgecolor="none", markersize=10, label="median time (right axis)"),
+    ]
+    fig.legend(handles=legend_handles, loc="lower center", ncol=2, fontsize=9, frameon=True)
+
+    fig.suptitle("B4 - family-contrast panels (the three designed experiments)", fontsize=13)
+    fig.tight_layout(rect=(0.0, 0.06, 1.0, 0.96))
+    out_path = out_dir / "b4_family_panels.png"
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
 
 
 # Registry mapping each chart key to its renderer. Adding a real chart in T2/T3
