@@ -1,10 +1,47 @@
-"""Incremental D* Lite search core in pure CELL space.
+"""Incremental D* Lite search core in pure CELL space, on a flat padded grid.
 
 This is the hand-rolled incremental replanning engine from Koenig & Likhachev,
 "Fast Replanning for Robot Navigation" (the optimised, ``k_m``-based D* Lite).
 It operates purely on a boolean occupancy grid in cell coordinates: no
-controller, no lidar, no Arena, no world-frame conversion. The controller wiring
-that turns this into a live planner is task T11.
+controller, no lidar, no Arena, no world-frame conversion. The controller
+wiring that turns this into a live planner is :class:`DStarLiteController`.
+
+Internal layout — flat, padded, list-based
+===========================================
+The public surface speaks ``(row, col)`` tuples, but the hot path works on a
+**flat, padded** representation that eliminates the per-edge Python-function and
+``numpy`` scalar overhead that dominated the original dict/tuple core:
+
+- **Padding.** A single ring of permanently-occupied border cells surrounds the
+  original ``rows x cols`` grid. The padded width is ``W = cols + 2``; the flat
+  index of an original ``(row, col)`` is ``(row + 1) * W + (col + 1)``. Because
+  the border is always occupied, *moving into* an out-of-bounds cell costs
+  ``inf`` for free — no per-edge bounds check is needed in the hot path. An
+  ``_interior`` mask (a ``bytearray``) flags the real cells, so predecessor
+  loops skip enqueuing border vertices (mirroring the old ``_neighbors``
+  in-bounds filter, so no wasted heap churn on the padding).
+- **Occupancy mirror.** ``self._grid`` keeps the live ``ndarray`` reference (the
+  ownership contract below is unchanged), but a fast padded ``list[bool]`` mirror
+  (``self._occ``) is built once in ``__init__`` and re-synced ONLY inside
+  :meth:`update_cells`, re-reading each reported changed cell's live value. Every
+  hot-path occupancy read hits the list mirror, not the ndarray. This makes the
+  *report-every-flip* contract load-bearing for occupancy correctness, not just
+  for the incremental invariants: a flip the caller never reports is never
+  re-synced into the mirror and the search will not see it.
+- **g / rhs as flat Python lists** of native floats sized ``n_padded`` (border
+  entries included but never relaxed), initialised to ``inf``. No dicts, no
+  ``numpy`` scalars in the hot path — costs are summed with ``math.sqrt`` and the
+  module-level :data:`INF`.
+- **Per-delta edge metadata** (:data:`_EDGE_META`) is precomputed once at import
+  in NEIGHBOR_DELTAS order, each entry ``(offset, step_cost, is_diagonal,
+  ortho_a, ortho_b)`` where the diagonal's two no-corner-cut neighbours are the
+  flat offsets ``dr*W`` and ``dc``. Orthogonal entries carry no ortho offsets.
+- **Heap entries are flat 4-tuples** ``(key0, key1, counter, cell_idx)`` — the
+  SAME comparison order as the old ``((k0, k1), counter, cell)``. Lazy deletion
+  is by insertion identity: ``self._latest[idx]`` records the counter of the most
+  recent insert for ``idx`` (0 = not queued); a popped entry is stale iff its
+  stored counter no longer matches ``_latest[idx]``. ``_update_vertex`` marks a
+  dequeue with ``_latest[idx] = 0``.
 
 Cost model — kept byte-for-byte consistent with ``manual_astar.astar_search``
 =============================================================================
@@ -13,10 +50,10 @@ A* would, so the edge-cost rules below mirror ``astar_search`` exactly:
 
 - 8-connected neighbours, using the same eight deltas in the same order
   (``(-1,-1) (-1,0) (-1,1) (0,-1) (0,1) (1,-1) (1,0) (1,1)``).
-- A cell ``c`` is traversable iff it is in bounds AND ``grid_cells[c]`` is False.
-  Moving *into* an occupied (or out-of-bounds) cell costs ``inf``.
-- Step cost: orthogonal moves cost ``1.0``; diagonal moves cost ``sqrt(2)`` via
-  ``np.hypot(delta_row, delta_col)`` — identical to ``astar_search``.
+- A cell ``c`` is traversable iff it is in bounds AND unoccupied. Moving *into*
+  an occupied (or out-of-bounds, i.e. padding) cell costs ``inf``.
+- Step cost: orthogonal moves cost ``1.0``; diagonal moves cost ``sqrt(2)`` —
+  identical to ``astar_search``'s ``np.hypot(delta_row, delta_col)``.
 - No corner cutting: a diagonal move from ``u`` to ``v`` is blocked (cost
   ``inf``) if EITHER of the two orthogonally-adjacent shared cells is occupied,
   exactly the ``row_neighbor`` / ``col_neighbor`` check in ``astar_search``.
@@ -30,26 +67,30 @@ monotone, which D* Lite's correctness proof requires.
 Grid ownership
 ==============
 ``DStarLiteSearch`` stores a *reference* to the ``grid_cells`` array, NOT a copy.
-T11 mutates that array in place (folding live lidar returns onto the static map)
-and then tells the search which cells changed via :meth:`update_cells`. Keeping a
-reference means the search always reads the caller's current occupancy; the
-caller is responsible for reporting every flip through :meth:`update_cells` so
-the incremental invariants stay intact.
+:class:`DStarLiteController` mutates that array in place (folding live lidar
+returns onto the static map) and then tells the search which cells changed via
+:meth:`update_cells`. Keeping a reference means the search always reads the
+caller's current occupancy when it re-syncs the mirror; the caller is
+responsible for reporting every flip through :meth:`update_cells` so both the
+occupancy mirror and the incremental invariants stay intact.
 
 Determinism
 ===========
-The priority queue is a binary heap of ``(key, counter, cell)`` triples where
-``counter`` is a strictly increasing insertion sequence number. Ties on ``key``
-are broken by ``counter`` (insertion order), never by cell identity, so no
-Python ``set`` iteration or dict ordering can influence which vertex is expanded
-first. Given the same ``(grid, start, goal, update-sequence)`` two runs produce
-byte-identical paths.
+The priority queue is a binary heap of ``(key0, key1, counter, cell_idx)``
+4-tuples where ``counter`` is a strictly increasing insertion sequence number.
+Ties on the ``(key0, key1)`` pair are broken by ``counter`` (insertion order),
+never by cell identity, so no Python ``set`` iteration or dict ordering can
+influence which vertex is expanded first. The affected-vertex set in
+:meth:`update_cells` is processed in sorted flat-index order (flat-index sort ==
+``(row, col)`` lexicographic sort), and ``extract_path`` breaks ties by first
+minimiser in NEIGHBOR_DELTAS order. Given the same
+``(grid, start, goal, update-sequence)`` two runs produce byte-identical paths.
 """
 
 from __future__ import annotations
 
 import heapq
-import itertools
+import math
 
 import numpy as np
 
@@ -76,7 +117,10 @@ from planners._grid import (
 )
 
 # The eight 8-connected neighbour deltas, in the SAME order as
-# manual_astar.astar_search. Order is load-bearing for deterministic expansion.
+# manual_astar.astar_search. Order is load-bearing for deterministic expansion
+# and for the first-minimiser tie-break in extract_path. Kept as a module
+# constant for documentation/order reference; the hot path uses the flat
+# per-delta metadata derived from it (see _build_edge_meta).
 NEIGHBOR_DELTAS: tuple[tuple[int, int], ...] = (
     (-1, -1),
     (-1, 0),
@@ -88,9 +132,16 @@ NEIGHBOR_DELTAS: tuple[tuple[int, int], ...] = (
     (1, 1),
 )
 
+# Native-float infinity; used everywhere so no numpy scalar enters the hot path.
+INF: float = float("inf")
+
+# Orthogonal / diagonal step costs as native floats.
+_STEP_ORTHO: float = 1.0
+_STEP_DIAG: float = math.sqrt(2.0)
+
 # sqrt(2) - 1, the per-cell penalty octile distance charges for each diagonal
 # step beyond the orthogonal baseline.
-_OCTILE_DIAGONAL_PENALTY: float = float(np.sqrt(2.0) - 1.0)
+_OCTILE_DIAGONAL_PENALTY: float = math.sqrt(2.0) - 1.0
 
 # Floating-point tolerance for every key / cost comparison in the engine.
 # D* Lite's correctness proof assumes exact arithmetic: it relies on the
@@ -111,11 +162,40 @@ Cell = tuple[int, int]
 Key = tuple[float, float]
 
 
+def _build_edge_meta(
+    width: int,
+) -> tuple[tuple[int, float, bool, int, int], ...]:
+    """Precompute the per-delta edge metadata in NEIGHBOR_DELTAS order.
+
+    Each entry is ``(offset, step_cost, is_diagonal, ortho_a, ortho_b)`` where
+    ``offset`` is the flat-index delta of the neighbour on a padded grid of width
+    ``width``. For a diagonal ``(dr, dc)`` the two cells that must both be free to
+    avoid corner-cutting are ``u + dr*W`` (the row-neighbour) and ``u + dc`` (the
+    col-neighbour); those flat offsets are stored as ``ortho_a`` / ``ortho_b``.
+    Orthogonal entries set ``is_diagonal=False`` and leave the ortho offsets at 0
+    (never read).
+    """
+    meta: list[tuple[int, float, bool, int, int]] = []
+    for delta_row, delta_col in NEIGHBOR_DELTAS:
+        offset = delta_row * width + delta_col
+        is_diagonal = delta_row != 0 and delta_col != 0
+        if is_diagonal:
+            ortho_a = delta_row * width  # row-neighbour: (u_row + dr, u_col)
+            ortho_b = delta_col          # col-neighbour: (u_row, u_col + dc)
+            meta.append((offset, _STEP_DIAG, True, ortho_a, ortho_b))
+        else:
+            meta.append((offset, _STEP_ORTHO, False, 0, 0))
+    return tuple(meta)
+
+
 class DStarLiteSearch:
     """Incremental D* Lite shortest-path search over a boolean occupancy grid.
 
-    Coordinates are ``(row, col)`` cell tuples indexing ``grid_cells`` directly,
-    matching ``manual_astar.astar_search``'s convention. ``True`` means blocked.
+    The public coordinates are ``(row, col)`` cell tuples indexing ``grid_cells``
+    directly, matching ``manual_astar.astar_search``'s convention (``True`` means
+    blocked). Internally the search runs on a flat, padded representation (see the
+    module docstring): a one-cell occupied border, flat ``g`` / ``rhs`` lists, a
+    padded occupancy mirror, and 4-tuple heap entries.
 
     The search is NOT run in ``__init__``; call :meth:`compute_shortest_path`
     after construction (and again after any :meth:`update_cells` /
@@ -148,51 +228,98 @@ class DStarLiteSearch:
         self._validate_in_bounds(start_cell, rows, cols, label="start_cell")
         self._validate_in_bounds(goal_cell, rows, cols, label="goal_cell")
 
-        # Store a REFERENCE: T11 mutates this array between update_cells calls and
-        # the search must observe those mutations. See module docstring.
+        # Store a REFERENCE: DStarLiteController mutates this array between
+        # update_cells calls and the search must observe those mutations when it
+        # re-syncs the occupancy mirror. See module docstring ("Grid ownership").
         self._grid: np.ndarray = grid_cells
         self._rows: int = rows
         self._cols: int = cols
 
-        self._s_start: Cell = (int(start_cell[0]), int(start_cell[1]))
-        self._s_goal: Cell = (int(goal_cell[0]), int(goal_cell[1]))
-        self._s_last: Cell = self._s_start
+        # Padded geometry. One ring of permanently-occupied border cells: the
+        # padded grid is (rows + 2) x (cols + 2), stored flat in row-major order.
+        self._width: int = cols + 2
+        self._height: int = rows + 2
+        self._n: int = self._width * self._height
+        self._edge_meta = _build_edge_meta(self._width)
+
+        # Occupancy mirror: a padded list[bool] with the border set True. Built
+        # once here, re-synced only at the reported flips inside update_cells.
+        padded = np.pad(grid_cells, pad_width=1, mode="constant", constant_values=True)
+        self._occ: list[bool] = padded.ravel().tolist()
+
+        # Interior mask: 1 for real (non-border) cells, 0 for the border ring.
+        # Used to skip enqueuing border vertices in the predecessor loops.
+        interior = np.zeros((self._height, self._width), dtype=np.uint8)
+        interior[1 : rows + 1, 1 : cols + 1] = 1
+        self._interior: bytearray = bytearray(interior.ravel().tobytes())
+
+        # Flat start / goal as padded indices, plus the original (row, col) the
+        # bookkeeping (calc_key, move_start, extract_path output) reasons about.
+        self._s_start_idx: int = self._to_padded(int(start_cell[0]), int(start_cell[1]))
+        self._s_goal_idx: int = self._to_padded(int(goal_cell[0]), int(goal_cell[1]))
+        self._s_last_idx: int = self._s_start_idx
         self._k_m: float = 0.0
 
-        # g / rhs default to +inf for every cell (lazily, via .get(..., inf)).
-        self._g: dict[Cell, float] = {}
-        self._rhs: dict[Cell, float] = {}
+        # g / rhs as flat native-float lists sized n_padded. Border entries are
+        # present but never relaxed (the interior mask gates re-enqueue).
+        self._g: list[float] = [INF] * self._n
+        self._rhs: list[float] = [INF] * self._n
 
-        # Lazy-deletion binary heap of (key, counter, cell). Staleness is decided
-        # by INSERTION IDENTITY, never by recomputing calc_key: `_latest_counter`
-        # records the counter of the most recent _insert for each queued cell, and
-        # `_queued` mirrors heap membership. A popped entry is stale (and skipped)
-        # iff its cell is no longer queued OR its stored counter no longer matches
-        # `_latest_counter[cell]` (a later _insert superseded it). This is what
-        # lets already-keyed entries survive move_start: their stored keys stay in
-        # the heap and the k_m/start drift is compensated inside the pop loop's
-        # re-key branch, NOT by deletion.
-        self._heap: list[tuple[Key, int, Cell]] = []
-        self._queued: set[Cell] = set()
-        self._latest_counter: dict[Cell, int] = {}
-        self._counter = itertools.count()
+        # Lazy-deletion binary heap of (key0, key1, counter, cell_idx). Staleness
+        # is decided by INSERTION IDENTITY, never by recomputing calc_key:
+        # `_latest[idx]` records the counter of the most recent _insert for idx
+        # (0 == not queued). A popped entry is stale iff its stored counter no
+        # longer matches `_latest[idx]` (a later _insert superseded it, or
+        # _update_vertex cleared it to 0). This is what lets already-keyed entries
+        # survive move_start: their stored keys stay in the heap and the k_m/start
+        # drift is compensated inside the pop loop's re-key branch, NOT by
+        # deletion. The counter starts at 1 so that 0 unambiguously means
+        # "not queued".
+        self._heap: list[tuple[float, float, int, int]] = []
+        self._latest: list[int] = [0] * self._n
+        self._counter: int = 0
 
         # Goal is the search root: rhs(goal) = 0, everything else +inf.
-        self._rhs[self._s_goal] = 0.0
-        self._insert(self._s_goal, self.calc_key(self._s_goal))
+        self._rhs[self._s_goal_idx] = 0.0
+        key = self._calc_key_idx(self._s_goal_idx)
+        self._insert(self._s_goal_idx, key)
+
+    # ------------------------------------------------------------------ #
+    # Padded-index helpers                                               #
+    # ------------------------------------------------------------------ #
+
+    def _to_padded(self, row: int, col: int) -> int:
+        """Flat padded index of original-grid ``(row, col)``."""
+        return (row + 1) * self._width + (col + 1)
+
+    def _from_padded(self, idx: int) -> Cell:
+        """Original-grid ``(row, col)`` of a padded flat index."""
+        prow, pcol = divmod(idx, self._width)
+        return (prow - 1, pcol - 1)
 
     # ------------------------------------------------------------------ #
     # Public API                                                         #
     # ------------------------------------------------------------------ #
 
     def calc_key(self, s: Cell) -> Key:
-        """The D* Lite priority key for cell ``s``.
+        """The D* Lite priority key for cell ``s`` (public ``(row, col)`` form).
 
         ``(min(g, rhs) + h(s_start, s) + k_m, min(g, rhs))`` — the lexicographic
         key that orders the open queue.
         """
-        g_rhs_min = min(self._get_g(s), self._get_rhs(s))
-        return (g_rhs_min + self._heuristic(self._s_start, s) + self._k_m, g_rhs_min)
+        return self._calc_key_idx(self._to_padded(int(s[0]), int(s[1])))
+
+    def _calc_key_idx(self, idx: int) -> Key:
+        """The priority key for a padded flat index (hot-path form).
+
+        Padding cancels in the coordinate differences, so the octile heuristic
+        between two padded indices equals the heuristic between their unpadded
+        ``(row, col)`` cells.
+        """
+        g = self._g[idx]
+        rhs = self._rhs[idx]
+        g_rhs_min = g if g < rhs else rhs
+        return (g_rhs_min + self._h_idx(self._s_start_idx, idx) + self._k_m, g_rhs_min)
 
     def compute_shortest_path(self) -> None:
         """Run the D* Lite main loop until ``s_start`` is locally consistent.
@@ -215,6 +342,11 @@ class DStarLiteSearch:
         live, rounding-tolerant keys, so a still-inconsistent frontier vertex is
         never skipped and the search never stops one expansion early.
         """
+        g = self._g
+        rhs = self._rhs
+        edge_meta = self._edge_meta
+        interior = self._interior
+
         while True:
             top = self._peek_valid()
             if top is None:
@@ -222,9 +354,10 @@ class DStarLiteSearch:
                 break
 
             # `k_old` is the entry's STORED key (its key at insertion time), NOT
-            # a recomputed calc_key — that is the whole point of Bug #1's fix.
-            k_old, u = top
-            k_new = self.calc_key(u)
+            # a recomputed calc_key — that is the whole point of the lazy re-key.
+            k0_old, k1_old, u = top
+            k_old = (k0_old, k1_old)
+            k_new = self._calc_key_idx(u)
 
             # A stored key can be badly STALE, not just ULP-off: after move_start
             # bumps k_m, an entry queued long ago carries a first component far
@@ -240,63 +373,80 @@ class DStarLiteSearch:
                 self._insert(u, k_new)
                 continue
 
-            start_key = self.calc_key(self._s_start)
+            start_key = self._calc_key_idx(self._s_start_idx)
 
             # Figure 3 loop guard: stop once the (now non-stale) top key no longer
             # beats the start key AND the start is locally consistent (rhs == g).
             if not self._key_lt(k_old, start_key) and self._floats_equal(
-                self._get_rhs(self._s_start), self._get_g(self._s_start)
+                rhs[self._s_start_idx], g[self._s_start_idx]
             ):
                 break
 
             self._pop_top()
 
-            g_u = self._get_g(u)
-            rhs_u = self._get_rhs(u)
+            g_u = g[u]
+            rhs_u = rhs[u]
 
             if g_u > rhs_u and not self._floats_equal(g_u, rhs_u):
                 # Overconsistent: settle g(u) := rhs(u), then UpdateVertex each
                 # predecessor (Succ == Pred on this undirected grid).
-                self._set_g(u, rhs_u)
-                for pred in self._neighbors(u):
-                    self._update_vertex(pred)
+                g[u] = rhs_u
+                for offset, _step, _diag, _oa, _ob in edge_meta:
+                    pred = u + offset
+                    if interior[pred]:
+                        self._update_vertex(pred)
             else:
                 # Underconsistent: raise g(u) := inf, then UpdateVertex u AND each
                 # predecessor so their rhs re-propagates around the raised vertex.
-                self._set_g(u, np.inf)
+                g[u] = INF
                 self._update_vertex(u)
-                for pred in self._neighbors(u):
-                    self._update_vertex(pred)
+                for offset, _step, _diag, _oa, _ob in edge_meta:
+                    pred = u + offset
+                    if interior[pred]:
+                        self._update_vertex(pred)
 
     def update_cells(self, changed_cells: list[Cell]) -> None:
-        """Report occupancy flips so incident edge costs are repaired.
+        """Report occupancy flips so incident edge costs and the mirror are repaired.
 
-        For each changed cell, every edge touching it changed cost, so we
-        re-evaluate the changed cell itself and each of its 8 neighbours via
-        ``update_vertex``. The caller must already have mutated ``grid_cells``
-        (and, when the robot moved, called :meth:`move_start`) BEFORE calling
-        this; here we only fix the affected vertices, then the next
-        :meth:`compute_shortest_path` propagates the change.
+        For each changed cell, every edge touching it changed cost, so we re-sync
+        the occupancy mirror at that cell and then re-evaluate the changed cell
+        itself and each of its 8 neighbours via ``update_vertex``. The caller must
+        already have mutated ``grid_cells`` (and, when the robot moved, called
+        :meth:`move_start`) BEFORE calling this; here we re-read the live value of
+        each reported cell into the mirror and fix the affected vertices, then the
+        next :meth:`compute_shortest_path` propagates the change.
         """
         if not isinstance(changed_cells, list):
             raise ValueError("changed_cells must be a list of (row, col) tuples.")
 
-        # Collect the changed cells plus their neighbours, de-duplicated but
-        # processed in a deterministic order (sorted) so repeated runs match.
-        affected: set[Cell] = set()
+        # Collect the changed cells plus their neighbours as padded flat indices,
+        # de-duplicated but processed in a deterministic order (sorted). A
+        # flat-index sort matches the old (row, col) lexicographic sort, so the
+        # deterministic processing order is preserved.
+        affected: set[int] = set()
+        edge_meta = self._edge_meta
+        interior = self._interior
         for cell in changed_cells:
-            normalized = (int(cell[0]), int(cell[1]))
-            if not self._in_bounds(normalized):
+            row = int(cell[0])
+            col = int(cell[1])
+            if not (0 <= row < self._rows and 0 <= col < self._cols):
                 raise ValueError(
                     f"changed cell {cell!r} is outside the grid bounds "
                     f"(rows={self._rows}, cols={self._cols})."
                 )
-            affected.add(normalized)
-            for neighbor in self._neighbors(normalized):
-                affected.add(neighbor)
+            idx = self._to_padded(row, col)
+            # Re-sync the mirror from the live ndarray at this reported flip. This
+            # is the ONLY place the mirror is updated, so the report-every-flip
+            # contract is load-bearing for occupancy correctness.
+            self._occ[idx] = bool(self._grid[row, col])
+            affected.add(idx)
+            for offset, _step, _diag, _oa, _ob in edge_meta:
+                neighbor = idx + offset
+                if interior[neighbor]:
+                    affected.add(neighbor)
 
-        for cell in sorted(affected):
-            self._update_vertex(cell)
+        for idx in sorted(affected):
+            self._update_vertex(idx)
 
     def move_start(self, new_start_cell: Cell) -> None:
         """Slide the search start to ``new_start_cell``.
@@ -304,59 +454,71 @@ class DStarLiteSearch:
         Accumulates the heuristic drift into ``k_m`` (so previously computed keys
         stay comparable without re-keying the whole queue) and records the move.
         """
-        normalized = (int(new_start_cell[0]), int(new_start_cell[1]))
-        if not self._in_bounds(normalized):
+        row = int(new_start_cell[0])
+        col = int(new_start_cell[1])
+        if not (0 <= row < self._rows and 0 <= col < self._cols):
             raise ValueError(
                 f"new_start_cell {new_start_cell!r} is outside the grid bounds "
                 f"(rows={self._rows}, cols={self._cols})."
             )
 
-        self._k_m += self._heuristic(self._s_last, normalized)
-        self._s_last = normalized
-        self._s_start = normalized
+        new_idx = self._to_padded(row, col)
+        self._k_m += self._h_idx(self._s_last_idx, new_idx)
+        self._s_last_idx = new_idx
+        self._s_start_idx = new_idx
 
     def extract_path(self) -> list[Cell]:
         """Greedily follow the gradient of ``cost(s, s') + g(s')`` to the goal.
 
-        Returns ``[s_start, ..., s_goal]``. Raises ``RuntimeError`` if the start
-        is unreachable (``g(s_start)`` is ``inf``) or if a cycle is detected (the
-        iteration cap of ``rows * cols`` is exceeded — should never trigger once
-        the search is consistent, but guards against a malformed state).
+        Returns ``[s_start, ..., s_goal]`` as original-grid ``(row, col)`` int
+        tuples. Raises ``RuntimeError`` if the start is unreachable
+        (``g(s_start)`` is ``inf``) or if a cycle is detected (the iteration cap of
+        ``rows * cols`` is exceeded — should never trigger once the search is
+        consistent, but guards against a malformed state).
         """
-        if not np.isfinite(self._get_g(self._s_start)):
+        if not math.isfinite(self._g[self._s_start_idx]):
             raise RuntimeError(
                 "No path from start to goal: g(s_start) is infinite."
             )
 
-        path: list[Cell] = [self._s_start]
-        current = self._s_start
+        g = self._g
+        occ = self._occ
+        edge_meta = self._edge_meta
+        goal_idx = self._s_goal_idx
+
+        path_idx: list[int] = [self._s_start_idx]
+        current = self._s_start_idx
         max_iterations = self._rows * self._cols
 
         for _ in range(max_iterations):
-            if current == self._s_goal:
-                return path
+            if current == goal_idx:
+                return [self._from_padded(idx) for idx in path_idx]
 
-            best_successor: Cell | None = None
-            best_cost = np.inf
-            for successor in self._neighbors(current):
-                step = self._cost(current, successor)
-                if not np.isfinite(step):
+            best_successor = -1
+            best_cost = INF
+            for offset, step_cost, is_diagonal, ortho_a, ortho_b in edge_meta:
+                successor = current + offset
+                # Border successors are occupied in the mirror, so this rejects
+                # out-of-bounds moves with no explicit bounds check.
+                if occ[successor]:
                     continue
-                total = step + self._get_g(successor)
+                if is_diagonal and (occ[current + ortho_a] or occ[current + ortho_b]):
+                    continue  # no corner cutting
+                total = step_cost + g[successor]
                 # Strict `<` with deterministic neighbour order means the first
                 # minimiser in NEIGHBOR_DELTAS order wins ties — reproducible.
                 if total < best_cost:
                     best_cost = total
                     best_successor = successor
 
-            if best_successor is None or not np.isfinite(best_cost):
+            if best_successor < 0 or not math.isfinite(best_cost):
                 raise RuntimeError(
                     "No path from start to goal: gradient descent reached a "
                     "dead end with no finite successor."
                 )
 
             current = best_successor
-            path.append(current)
+            path_idx.append(current)
 
         raise RuntimeError(
             "extract_path exceeded the iteration cap; the search state is "
@@ -376,104 +538,70 @@ class DStarLiteSearch:
                 f"(rows={rows}, cols={cols})."
             )
 
-    def _in_bounds(self, cell: Cell) -> bool:
-        row, col = cell
-        return 0 <= row < self._rows and 0 <= col < self._cols
+    def _h_idx(self, a_idx: int, b_idx: int) -> float:
+        """Octile distance between two padded flat indices.
 
-    def _is_occupied(self, cell: Cell) -> bool:
-        # bool() unwraps numpy.bool_ to a native bool for clean comparisons.
-        return bool(self._grid[cell])
-
-    def _get_g(self, s: Cell) -> float:
-        return self._g.get(s, np.inf)
-
-    def _get_rhs(self, s: Cell) -> float:
-        return self._rhs.get(s, np.inf)
-
-    def _set_g(self, s: Cell, value: float) -> None:
-        self._g[s] = value
-
-    def _heuristic(self, a: Cell, b: Cell) -> float:
-        """Octile distance, consistent with the orthogonal=1 / diagonal=sqrt(2)
-        cost model: ``max(dx, dy) + (sqrt(2) - 1) * min(dx, dy)``."""
-        dx = abs(a[0] - b[0])
-        dy = abs(a[1] - b[1])
-        return float(max(dx, dy) + _OCTILE_DIAGONAL_PENALTY * min(dx, dy))
-
-    def _neighbors(self, cell: Cell) -> list[Cell]:
-        """In-bounds 8-connected neighbours, in NEIGHBOR_DELTAS order.
-
-        Returns geometric neighbours regardless of occupancy; traversability is
-        decided per-edge in :meth:`_cost`. Order is deterministic.
+        Consistent with the orthogonal=1 / diagonal=sqrt(2) cost model:
+        ``max(dx, dy) + (sqrt(2) - 1) * min(dx, dy)``. Padding cancels in the
+        coordinate differences, so working on padded indices is exact.
         """
-        row, col = cell
-        result: list[Cell] = []
-        for delta_row, delta_col in NEIGHBOR_DELTAS:
-            neighbor = (row + delta_row, col + delta_col)
-            if self._in_bounds(neighbor):
-                result.append(neighbor)
-        return result
+        width = self._width
+        ar, ac = divmod(a_idx, width)
+        br, bc = divmod(b_idx, width)
+        dx = ar - br
+        if dx < 0:
+            dx = -dx
+        dy = ac - bc
+        if dy < 0:
+            dy = -dy
+        if dx >= dy:
+            return dx + _OCTILE_DIAGONAL_PENALTY * dy
+        return dy + _OCTILE_DIAGONAL_PENALTY * dx
 
-    def _cost(self, u: Cell, v: Cell) -> float:
-        """Edge cost of moving from ``u`` to an 8-neighbour ``v``.
-
-        Mirrors ``astar_search`` exactly:
-        - ``inf`` if ``v`` is out of bounds or occupied (can't move into it);
-        - ``inf`` for a diagonal move if EITHER shared orthogonal cell is
-          occupied (no corner cutting);
-        - otherwise ``np.hypot(delta_row, delta_col)`` (1.0 / sqrt(2)).
-        """
-        if not self._in_bounds(v) or self._is_occupied(v):
-            return np.inf
-
-        delta_row = v[0] - u[0]
-        delta_col = v[1] - u[1]
-
-        if delta_row != 0 and delta_col != 0:
-            row_neighbor = (u[0] + delta_row, u[1])
-            col_neighbor = (u[0], u[1] + delta_col)
-            # Both shared orthogonal cells are in bounds here because v is in
-            # bounds and they each share one coordinate with v.
-            if self._is_occupied(row_neighbor) or self._is_occupied(col_neighbor):
-                return np.inf
-
-        return float(np.hypot(delta_row, delta_col))
-
-    def _update_vertex(self, u: Cell) -> None:
+    def _update_vertex(self, u: int) -> None:
         """Recompute ``rhs(u)`` from successors and re-sync ``u``'s queue slot.
 
         For every cell except the goal, ``rhs(u) = min over successors s of
-        cost(u, s) + g(s)``. The vertex is then removed from the queue and, if it
-        is locally inconsistent (``g != rhs``), re-inserted with a fresh key.
+        cost(u, s) + g(s)`` (inlined here over the 8 padded neighbours, with the
+        same occupancy / no-corner-cut rules as :meth:`extract_path`). The vertex
+        is then removed from the queue and, if it is locally inconsistent
+        (``g != rhs``), re-inserted with a fresh key.
         """
-        if u != self._s_goal:
-            best = np.inf
-            for successor in self._neighbors(u):
-                candidate = self._cost(u, successor) + self._get_g(successor)
+        if u != self._s_goal_idx:
+            occ = self._occ
+            g = self._g
+            best = INF
+            for offset, step_cost, is_diagonal, ortho_a, ortho_b in self._edge_meta:
+                successor = u + offset
+                if occ[successor]:
+                    continue  # occupied or border => edge cost inf
+                if is_diagonal and (occ[u + ortho_a] or occ[u + ortho_b]):
+                    continue  # no corner cutting
+                candidate = step_cost + g[successor]
                 if candidate < best:
                     best = candidate
             self._rhs[u] = best
 
-        # Remove any existing queue slot (lazy: we just drop membership; the
-        # stale heap entry is skipped on pop because the cell is no longer queued
-        # — or, after a fresh _insert, because its stored counter is superseded).
-        self._queued.discard(u)
-        self._latest_counter.pop(u, None)
+        # Remove any existing queue slot (lazy: clear the latest-counter marker;
+        # the stale heap entry is skipped on pop because its stored counter no
+        # longer matches `_latest[u]` — or, after a fresh _insert, because that
+        # later insert superseded it).
+        self._latest[u] = 0
 
         # Re-queue iff locally inconsistent. The tolerant equality keeps a vertex
         # whose g and rhs differ only by a rounding ULP OUT of the queue, so it is
         # never popped and mis-classified as under/overconsistent in the main
         # loop (which would corrupt g with an inf or a stale rhs).
-        if not self._floats_equal(self._get_g(u), self._get_rhs(u)):
-            self._insert(u, self.calc_key(u))
+        if not self._floats_equal(self._g[u], self._rhs[u]):
+            self._insert(u, self._calc_key_idx(u))
 
-    def _insert(self, cell: Cell, key: Key) -> None:
-        """Push ``cell`` with ``key``, mark it queued, and record this insertion
-        as the cell's latest (so any earlier heap entry for it becomes stale)."""
-        counter = next(self._counter)
-        heapq.heappush(self._heap, (key, counter, cell))
-        self._queued.add(cell)
-        self._latest_counter[cell] = counter
+    def _insert(self, idx: int, key: Key) -> None:
+        """Push ``idx`` with ``key``, and record this insertion as the cell's
+        latest (so any earlier heap entry for it becomes stale)."""
+        self._counter += 1
+        counter = self._counter
+        heapq.heappush(self._heap, (key[0], key[1], counter, idx))
+        self._latest[idx] = counter
 
     @staticmethod
     def _floats_equal(left: float, right: float) -> bool:
@@ -486,7 +614,7 @@ class DStarLiteSearch:
         """
         if left == right:
             return True
-        if np.isinf(left) or np.isinf(right):
+        if math.isinf(left) or math.isinf(right):
             return False
         return abs(left - right) <= _KEY_EPSILON
 
@@ -502,71 +630,84 @@ class DStarLiteSearch:
             return left[1] < right[1] and not cls._floats_equal(left[1], right[1])
         return left[0] < right[0]
 
-    def _peek_valid(self) -> tuple[Key, Cell] | None:
-        """Return the (STORED key, cell) of the smallest *valid* heap entry, None
-        if the queue is empty.
+    def _peek_valid(self) -> tuple[float, float, int] | None:
+        """Return ``(stored_key0, stored_key1, cell_idx)`` of the smallest *valid*
+        heap entry, or None if the queue is empty.
 
         Staleness is decided by INSERTION IDENTITY, never by recomputing
-        calc_key (Bug #1): an entry is stale iff its cell is no longer queued OR
-        its stored counter no longer matches the cell's latest insertion counter
-        (a newer _insert superseded it). Valid entries keep their stored keys so
-        the k_m/start drift introduced by move_start is compensated in the pop
-        loop's re-key branch rather than by dropping still-needed vertices.
+        calc_key: an entry is stale iff its stored counter no longer matches the
+        cell's latest insertion counter (a newer _insert superseded it, or
+        _update_vertex cleared `_latest[idx]` to 0). Valid entries keep their
+        stored keys so the k_m/start drift introduced by move_start is compensated
+        in the pop loop's re-key branch rather than by dropping still-needed
+        vertices.
         """
-        while self._heap:
-            stored_key, stored_counter, cell = self._heap[0]
-            if (
-                cell not in self._queued
-                or self._latest_counter.get(cell) != stored_counter
-            ):
-                heapq.heappop(self._heap)
+        heap = self._heap
+        latest = self._latest
+        while heap:
+            k0, k1, stored_counter, idx = heap[0]
+            if latest[idx] != stored_counter:
+                heapq.heappop(heap)
                 continue
-            return stored_key, cell
+            return k0, k1, idx
         return None
 
     def _pop_top(self) -> None:
         """Pop the validated top entry and clear its queue membership."""
-        _, _, cell = heapq.heappop(self._heap)
-        self._queued.discard(cell)
-        self._latest_counter.pop(cell, None)
+        _, _, _, idx = heapq.heappop(self._heap)
+        self._latest[idx] = 0
 
 
 # --------------------------------------------------------------------------- #
-# Controller wiring (T11)                                                      #
+# Controller wiring                                                           #
 # --------------------------------------------------------------------------- #
 
 
 class DStarLiteController:
     """Incremental D* Lite `Controller` over a lidar-folded occupancy grid.
 
-    Plans once at `reset()` from the t=0 lidar fold. On every `act()` it re-folds
-    the live scan, feeds ONLY the changed cells to the search via
-    :meth:`DStarLiteSearch.update_cells`, and lets the search incrementally repair
-    its `g`/`rhs` — so the D* Lite machinery runs at every tick, which is the
-    point of this family (there is no `_once` / `_replan` split, Mission.md: D*
-    Lite is inherently incremental).
+    Plans once at `reset()` from the t=0 lidar fold. On every `act()` it does the
+    cheap edge-cost BOOKKEEPING every tick — re-fold the live scan, diff it
+    against `self._cells`, mutate `self._cells` in place at the flipped positions,
+    `move_start(current_cell)`, and (when cells flipped) `update_cells(changed)` —
+    but it DEFERS the expensive tree settle. `compute_shortest_path()` runs only
+    at the moment a fresh path is actually needed: when the waypoint follower has
+    finished OR the immediate segment it is about to traverse (the robot pose ->
+    its current target waypoint) is no longer clear in the live folded grid.
 
-    The *path the robot steers by* is re-extracted only when the current waypoint
-    follower has finished OR the immediate segment it is about to traverse (the
-    robot pose -> its current target waypoint) is no longer clear in the live
-    folded grid. Re-extracting on every changed cell instead whipsaws the heading:
-    folding a live scan repaints a thick inflation band around every wall return,
-    so the optimal cell path jitters one or two cells each tick even on a static
-    map, and rebuilding the follower from a jittering path (its index reset to the
-    current pose) starves forward speed and the robot times out. Committing to a
-    path until its immediate segment is actually blocked keeps the robot at full
-    speed on a clear run yet still replans the instant a dynamic obstacle crosses
-    in front of it.
+    Why defer the settle. The repaired `g`/`rhs` tree is only ever *consumed* at
+    re-extraction, which is rare on a clear run; settling it on every tick was ~89%
+    of `act()`'s wallclock (with ~20 moving obstacles each fold flips hundreds of
+    inflation-band cells, so the per-tick settle did a large repair whose result
+    was thrown away unread), and that cost blew the 600 s per-episode wallclock
+    wall on 9 of 50 batch episodes. Deferring the settle is exactly what D* Lite's
+    `k_m` machinery exists to support: `move_start` accumulates the heuristic drift
+    into `k_m` so stored keys stay comparable across many `update_cells` batches,
+    and a single settle at demand-time folds all of those batched edge changes into
+    the same optimum a from-scratch A* would find (proved by TC46).
+
+    Committing to a path until its immediate segment is actually blocked also
+    avoids a heading whipsaw: re-extracting on every changed cell instead repaints
+    a thick inflation band around every wall return, so the optimal cell path
+    jitters one or two cells each tick even on a static map, and rebuilding the
+    follower from a jittering path (its index reset to the current pose) starves
+    forward speed and times the robot out. The commitment horizon keeps the robot
+    at full speed on a clear run yet still replans the instant a dynamic obstacle
+    crosses in front of it.
 
     Grid ownership is the load-bearing invariant: `self._cells` is the SAME
     ndarray the search was constructed with. `act()` mutates that array in place
-    at the flipped positions and reports them through `update_cells`; it never
-    rebinds `self._cells` to a freshly folded array (that would detach the
-    search's view and silently desynchronise the incremental edge costs).
+    at the flipped positions and reports them through `update_cells` (which both
+    re-syncs the search's occupancy mirror and repairs the affected vertices); it
+    never rebinds `self._cells` to a freshly folded array (that would detach the
+    search's view and silently desynchronise the occupancy mirror and the
+    incremental edge costs). Reporting every flip through `update_cells` is what
+    keeps the mirror correct, not merely an incremental-invariant nicety.
 
     A t=0 planning failure in `reset()` propagates so the runner records
-    `planner_error`. A mid-episode replan failure in `act()` is swallowed — the
-    last valid follower is kept, never rebuilt — so `act()` never raises (AC8).
+    `planner_error`. A mid-episode failure in `act()` (a deferred settle or
+    re-extraction that raises) is swallowed — the last valid follower is kept,
+    never rebuilt — so `act()` never raises (AC8).
     """
 
     name = "d_star_lite"
@@ -622,9 +763,9 @@ class DStarLiteController:
         )
 
         self._search = DStarLiteSearch(self._cells, start_cell, goal_cell)
+        # The one t=0 settle. Raises RuntimeError if the start cannot reach the
+        # goal; the runner turns that into planner_error.
         self._search.compute_shortest_path()
-        # Raises RuntimeError if the start cannot reach the goal; the runner turns
-        # that into planner_error.
         cells_path = self._search.extract_path()
 
         waypoints = grid_path_to_waypoints(
@@ -649,10 +790,18 @@ class DStarLiteController:
 
         position = np.asarray(state[:2], dtype=float)
 
+        # --- Per-tick edge-cost bookkeeping (cheap; runs every tick) ---------
         new_cells = lidar_to_occupancy(
             self._static_cells, self._grid, state, lidar, self._geom, self._inflation
         )
         diff_mask = self._cells != new_cells
+
+        current_cell = world_to_grid(position, self._grid)
+        # move_start is O(1) and bumps k_m by h(s_last, s_new) (== 0 when the robot
+        # has not changed cells). Call it UNCONDITIONALLY so the start the deferred
+        # settle / extraction reasons about is never stale on a no-change tick.
+        # Order within a changed tick stays: move_start FIRST, then update_cells.
+        self._search.move_start(current_cell)
 
         if bool(diff_mask.any()):
             # Deterministic, de-duplicated list of the flipped (row, col) cells.
@@ -662,29 +811,21 @@ class DStarLiteController:
 
             # CRITICAL: mutate the EXISTING array in place — the search holds a
             # reference to it. Do NOT rebind self._cells to new_cells, which would
-            # detach the search's view and desynchronise its incremental costs.
+            # detach the search's view and desynchronise its occupancy mirror and
+            # incremental costs. update_cells re-syncs the mirror at these flips.
             self._cells[diff_mask] = new_cells[diff_mask]
-
-            current_cell = world_to_grid(position, self._grid)
-            # Canonical optimized D* Lite order: bump k_m via move_start FIRST, then
-            # repair the changed edges, then recompute the shortest-path tree. This
-            # runs every changed tick so the incremental g/rhs stays current; the
-            # path the robot follows is only re-extracted on demand below.
-            self._search.move_start(current_cell)
             self._search.update_cells(changed)
-            try:
-                self._search.compute_shortest_path()
-            except (ValueError, RuntimeError):
-                # Keep the last valid follower; never rebuild it (AC8). A failed
-                # incremental pass leaves the previous g/rhs in place, so the held
-                # path stays drivable.
-                return compute_action_from_state(state, self._follower)
 
+        # --- Deferred settle, on demand --------------------------------------
         # Re-extract the followed path only when the held one is exhausted or its
         # imminent segment is now blocked — otherwise keep committing to it so a
-        # clear run holds full speed instead of chasing the lidar-fold jitter.
+        # clear run holds full speed instead of chasing the lidar-fold jitter. The
+        # expensive compute_shortest_path() runs HERE, not per tick: this is the
+        # one place the repaired tree is actually consumed. A failure (settle or
+        # extraction) keeps the last valid follower; never rebuild it (AC8).
         if self._follower.is_finished or self._immediate_segment_blocked(position):
             try:
+                self._search.compute_shortest_path()
                 cells_path = self._search.extract_path()
                 waypoints = grid_path_to_waypoints(
                     cells_path,
@@ -699,7 +840,8 @@ class DStarLiteController:
                         list(waypoints), WAYPOINT_REACHED_DISTANCE
                     )
             except (ValueError, RuntimeError):
-                # Keep the last valid path/follower; never rebuild it (AC8).
+                # A failed incremental pass leaves the previous g/rhs and follower
+                # in place, so the held path stays drivable.
                 pass
 
         return compute_action_from_state(state, self._follower)
