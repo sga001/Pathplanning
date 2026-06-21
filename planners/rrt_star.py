@@ -7,8 +7,8 @@ steps give the tree its asymptotic-optimality property: the reconstructed path i
 observably shorter than plain RRT's for the same sample sequence.
 
 This module REUSES the deterministic RRT core from ``planners.rrt`` verbatim — the
-goal-biased sampler, the first-argmin nearest-node search, the steer function, the
-``segment_is_clear_grid`` edge check (re-exported by ``planners._grid``), the
+goal-biased sampler, the steer function, the allocation-free ``_segment_clear_fast``
+edge check, the buffer-backed ``_nearest_index_in_array`` nearest-node search, the
 parent-walk reconstruction, ``rrt_points_to_waypoints``, ``rrt_planned_cost``, and
 the shared tuned constants (``RRT_SEED``, ``RRT_MAX_ITERS``, ``RRT_STEP``,
 ``RRT_GOAL_BIAS``, ``RRT_GOAL_TOLERANCE``, ``POINT_EPSILON``). Importing these
@@ -17,6 +17,12 @@ intentional reuse (the plan: "Imports the sampling/steer/nearest/collision helpe
 from planners/rrt.py"): it keeps the sample sequence and node positions byte-for-byte
 identical to RRT, so only the parent structure (and thus the rewired, shorter path)
 differs.
+
+``_segment_clear_fast`` and ``_nearest_index_in_array`` are the T3/T4 perf twins of
+``segment_is_clear_grid`` and the per-iteration ``np.asarray(nodes)`` rebuild: each
+returns the BIT-IDENTICAL bool / index over the same inputs, so swapping them in keeps
+the planned path, cost, and ``trace.jsonl`` byte-identical while removing the inner
+loop's per-edge numpy boxing and the growing node-buffer rebuild.
 
 **Why determinism survives the optimality steps.** In RRT* a new node's POSITION is
 still ``_steer(nearest, sample)`` exactly as in plain RRT — choose-parent and rewire
@@ -51,7 +57,6 @@ from manual_astar import (
 from planners._grid import (
     PathFollowingController,
     register,
-    segment_is_clear_grid,
 )
 from planners._types import Path
 from planners.rrt import (
@@ -61,9 +66,10 @@ from planners.rrt import (
     RRT_SEED,
     RRT_STEP,
     _cell_is_free,
-    _nearest_node_index,
+    _nearest_index_in_array,
     _reconstruct_points,
     _sample_free_point,
+    _segment_clear_fast,
     _steer,
     rrt_points_to_waypoints,
 )
@@ -132,23 +138,41 @@ def rrt_star_plan(
     # parent (-1 for the root), costs[i] the cost-to-come from the start. `children`
     # is the inverse of `parents`, maintained so rewire can propagate a cost delta to
     # a re-parented node's whole subtree in deterministic (ascending-index) order.
+    # These lists are KEPT (not replaced by the buffer): `_choose_parent`, `_rewire`,
+    # `_reconstruct_points`, and the cost/children bookkeeping all index `nodes[i]`.
     nodes: list[np.ndarray] = [start_point]
     parents: list[int] = [-1]
     costs: list[float] = [0.0]
     children: list[list[int]] = [[]]
 
+    # Incremental node-position buffer (Part B): a preallocated, C-contiguous
+    # `(capacity, 2)` float array mirroring `nodes`, scanned as a `[:count]` slice for
+    # the nearest-neighbour argmin AND the NEAR-set radius query. This replaces the
+    # per-iteration `np.asarray(nodes)` rebuild that ran inside both `_nearest_node_index`
+    # and `_near_node_indices` — small now (~4-7%) but growing proportionally once the
+    # LOS check is fast — while staying byte-identical to it (same float values, same
+    # C-contiguous layout, same einsum reductions, same argmin/flatnonzero tie order).
+    # Doubling growth keeps appends amortized O(1). The buffer is appended at the SAME
+    # point the node is accepted into `nodes` (after choose-parent assigns the index),
+    # so `positions[:count]` always holds exactly the nodes that existed when nearest
+    # and near were queried for this iteration.
+    capacity = 16
+    positions = np.empty((capacity, 2), dtype=float)
+    positions[0] = start_point
+    count = 1
+
     for _ in range(RRT_MAX_ITERS):
         sample = _sample_free_point(grid, goal_point, rng)
-        nearest_index = _nearest_node_index(nodes, sample)
+        nearest_index = _nearest_index_in_array(positions, count, sample)
         nearest_point = nodes[nearest_index]
         new_point = _steer(nearest_point, sample)
 
         # The nearest edge is the fallback parent; if even it is blocked the steered
         # node is unreachable, so drop the iteration (mirrors rrt_plan's skip).
-        if not segment_is_clear_grid(grid_cells, grid, nearest_point, new_point):
+        if not _segment_clear_fast(grid_cells, grid, nearest_point, new_point):
             continue
 
-        near_indices = _near_node_indices(nodes, new_point)
+        near_indices = _near_node_indices(positions, count, new_point)
 
         parent_index, parent_cost = _choose_parent(
             nodes, costs, near_indices, nearest_index, new_point, grid_cells, grid
@@ -160,6 +184,17 @@ def rrt_star_plan(
         costs.append(parent_cost)
         children.append([])
         children[parent_index].append(new_index)
+
+        # Mirror the accepted node into the position buffer, doubling capacity when
+        # full so the contiguous scan slice always covers every tree node. This happens
+        # after the index is assigned so positions[:count] matches `nodes` exactly.
+        if count == capacity:
+            capacity *= 2
+            grown = np.empty((capacity, 2), dtype=float)
+            grown[:count] = positions[:count]
+            positions = grown
+        positions[count] = new_point
+        count += 1
 
         _rewire(
             nodes, parents, costs, children, near_indices, new_index, grid_cells, grid
@@ -176,15 +211,26 @@ def rrt_star_plan(
     )
 
 
-def _near_node_indices(nodes: list[np.ndarray], new_point: np.ndarray) -> list[int]:
+def _near_node_indices(
+    positions: np.ndarray, count: int, new_point: np.ndarray
+) -> list[int]:
     """Indices of existing tree nodes within ``RRT_STAR_NEIGHBOR_RADIUS`` of ``new_point``.
 
     Returned in ascending index order (the natural scan order of the node list) so the
     downstream choose-parent / rewire passes are fully order-deterministic — no
     distance sort, no set, so ties never reorder run to run (AC4).
+
+    Buffer-backed (Part B): scans the contiguous ``positions[:count]`` slice of the
+    preallocated ``(capacity, 2)`` float buffer instead of rebuilding
+    ``np.asarray(nodes)`` every iteration. This is BYTE-IDENTICAL to the prior
+    list-based version — same float values (the buffer mirrors ``nodes`` exactly),
+    same ``einsum`` reduction, same ``radius_sq`` (``RRT_STAR_NEIGHBOR_RADIUS``
+    squared), and ``np.flatnonzero`` already scans ascending — so the NEAR set, and
+    thus the chosen parents / rewired costs / planned path, are unchanged (the
+    byte-identity is load-bearing for the trace). The function is module-private (used
+    only by ``rrt_star_plan``), so the buffer-typed signature is safe.
     """
-    stacked = np.asarray(nodes, dtype=float)
-    deltas = stacked - new_point
+    deltas = positions[:count] - new_point
     distances_sq = np.einsum("ij,ij->i", deltas, deltas)
     radius_sq = RRT_STAR_NEIGHBOR_RADIUS * RRT_STAR_NEIGHBOR_RADIUS
     # np.flatnonzero scans ascending, so the result is already index-ordered.
@@ -221,7 +267,7 @@ def _choose_parent(
             # Already accounted for as the fallback; its edge is clear by construction.
             continue
         near_point = nodes[near_index]
-        if not segment_is_clear_grid(grid_cells, grid, near_point, new_point):
+        if not _segment_clear_fast(grid_cells, grid, near_point, new_point):
             continue
         candidate_cost = costs[near_index] + float(np.linalg.norm(new_point - near_point))
         if candidate_cost < best_cost - POINT_EPSILON:
@@ -262,7 +308,7 @@ def _rewire(
         rerouted_cost = new_cost + float(np.linalg.norm(near_point - new_point))
         if rerouted_cost >= costs[near_index] - POINT_EPSILON:
             continue
-        if not segment_is_clear_grid(grid_cells, grid, new_point, near_point):
+        if not _segment_clear_fast(grid_cells, grid, new_point, near_point):
             continue
 
         # Detach `near` from its old parent and graft it under the new node.

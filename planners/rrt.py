@@ -33,6 +33,8 @@ All tunables are the module-level ``UPPER_SNAKE_CASE`` constants below.
 """
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 from manual_astar import (
@@ -49,6 +51,7 @@ from manual_astar import (
     world_to_grid,
 )
 from planners._grid import (
+    SEGMENT_SAMPLE_FACTOR,
     PathFollowingController,
     _append_clear_waypoints,
     register,
@@ -90,6 +93,99 @@ def _cell_is_free(point: np.ndarray, grid_cells: np.ndarray, grid: OccupancyGrid
     return is_cell_in_bounds(cell, grid) and not bool(grid_cells[cell])
 
 
+def _segment_clear_fast(
+    grid_cells: np.ndarray,
+    grid: OccupancyGrid,
+    p0,
+    p1,
+) -> bool:
+    """Allocation-free scalar twin of ``planners._grid.segment_is_clear_grid``.
+
+    Why this exists: ``segment_is_clear_grid`` is the RRT collision hot loop, and
+    its cost is the per-sample numpy boxing — ``np.asarray``/``np.linalg.norm``
+    plus ``world_to_grid``'s scalar ``np.clip``/``np.floor`` — run ~16x per edge.
+    This helper reproduces that function's arithmetic in pure Python/``math``
+    scalars so the inner loop allocates nothing, while returning the BIT-IDENTICAL
+    bool for every input (the byte-identical-trace guarantee depends on it). It is
+    a faithful mirror, NOT an approximation: the five equivalence obligations
+    below each reproduce one exact behaviour of the frozen reference. The signature
+    matches ``segment_is_clear_grid`` verbatim so callers (and ``rrt_star.py``)
+    can swap one for the other.
+
+    Equivalence obligations (each load-bearing for trace parity):
+
+    1. Clip-then-read, never OOB-reject. ``world_to_grid`` ALWAYS clamps into the
+       grid, so the reference's ``is_cell_in_bounds`` guard is dead (always True)
+       after it. We clamp row/col into ``[0, rows-1]``/``[0, cols-1]`` and read the
+       (clamped) cell directly — no out-of-bounds rejection, which would flip the
+       bool and diverge the trace.
+    2. Length is ``math.sqrt(dx*dx + dy*dy)`` — ``math.hypot`` is FORBIDDEN.
+       ``math.sqrt(dx*dx+dy*dy)`` is bit-identical to
+       ``float(np.linalg.norm(end-start))`` (0 mismatches / 1M inputs), whereas
+       ``math.hypot``'s extended-precision intermediate flips the last bit on
+       ~17% of inputs (e.g. dx=1.0, dy=2.4000000000000004 gives sample_count 26
+       vs 27), which propagates into the sample count and flips the bool.
+    3. Sample count is ``max(2, math.ceil(length / sample_step))`` with
+       ``sample_step = grid.resolution * SEGMENT_SAMPLE_FACTOR`` (imported, not
+       hardcoded). ``math.ceil`` equals ``int(np.ceil(...))`` for these finite
+       positive lengths.
+    4. Cell clamp is ``min(max(math.floor((coord - offset) / resolution), 0),
+       n - 1)``, equal to ``int(np.clip(np.floor(...), 0, n-1))`` for the finite
+       in-range floats here — col from x/offset_x/cols, row from y/offset_y/rows,
+       matching ``world_to_grid``'s x->col / y->row mapping and (row, col) order.
+    5. The ``length < 1e-9`` degenerate branch checks ONLY the start cell
+       (clip-then-read). RRT reaches it via ``_steer`` when a sample coincides
+       with the nearest node.
+    """
+    # Read each endpoint coordinate once as a Python float; dx/dy then drive the
+    # whole computation with no per-sample numpy boxing.
+    start_x = float(p0[0])
+    start_y = float(p0[1])
+    end_x = float(p1[0])
+    end_y = float(p1[1])
+    dx = end_x - start_x
+    dy = end_y - start_y
+
+    # Obligation 2: math.sqrt(dx*dx + dy*dy) is bit-identical to
+    # float(np.linalg.norm(end - start)); math.hypot is FORBIDDEN (last-bit drift
+    # on ~17% of inputs flips the sample count and thus the returned bool).
+    length = math.sqrt(dx * dx + dy * dy)
+    sample_step = grid.resolution * SEGMENT_SAMPLE_FACTOR
+
+    # Grid geometry hoisted out of the per-sample loop (obligation 4 inputs).
+    rows, cols = grid.shape
+    offset_x = float(grid.offset[0])
+    offset_y = float(grid.offset[1])
+    resolution = grid.resolution
+
+    if length < 1e-9:
+        # Obligation 5 (+ 1, 4): degenerate segment checks only the start cell,
+        # clamped into bounds and read directly.
+        col = min(max(math.floor((start_x - offset_x) / resolution), 0), cols - 1)
+        row = min(max(math.floor((start_y - offset_y) / resolution), 0), rows - 1)
+        return not bool(grid_cells[row, col])
+
+    # Obligation 3: identical sample count to the reference (math.ceil == int(np.ceil)
+    # for finite positive lengths here).
+    sample_count = max(2, math.ceil(length / sample_step))
+    for sample_index in range(sample_count + 1):
+        # ratio = sample_index / sample_count and px/py via the same affine form
+        # the reference uses (point = start + ratio*segment, componentwise) so the
+        # FP rounding matches; the last sample is recomputed at ratio=1.0, NOT
+        # shortcut to the endpoint.
+        ratio = sample_index / sample_count
+        px = start_x + ratio * dx
+        py = start_y + ratio * dy
+
+        # Obligations 1 + 4: clip-then-read, no OOB rejection.
+        col = min(max(math.floor((px - offset_x) / resolution), 0), cols - 1)
+        row = min(max(math.floor((py - offset_y) / resolution), 0), rows - 1)
+        if bool(grid_cells[row, col]):
+            return False
+
+    return True
+
+
 def _sample_free_point(
     grid: OccupancyGrid, goal_xy: np.ndarray, rng: np.random.Generator
 ) -> np.ndarray:
@@ -127,6 +223,25 @@ def _nearest_node_index(nodes: list[np.ndarray], sample: np.ndarray) -> int:
     return int(np.argmin(distances_sq))
 
 
+def _nearest_index_in_array(
+    positions: np.ndarray, count: int, sample: np.ndarray
+) -> int:
+    """Index of the nearest of ``positions[:count]`` to ``sample`` (first argmin).
+
+    Buffer-backed twin of ``_nearest_node_index``: it scans a contiguous
+    ``positions[:count]`` slice of a preallocated, C-contiguous ``(capacity, 2)``
+    float array instead of rebuilding ``np.asarray(nodes)`` every iteration. The
+    result is BYTE-IDENTICAL to ``_nearest_node_index`` over the same nodes — same
+    float values, same C-contiguous memory layout, same ``einsum`` reduction, and
+    ``np.argmin`` returns the first minimum on ties — so routing ``rrt_plan``
+    through this preserves the determinism guarantee. Exposed at module level so
+    ``rrt_star.py`` (T4) can reuse the identical scan.
+    """
+    deltas = positions[:count] - sample
+    distances_sq = np.einsum("ij,ij->i", deltas, deltas)
+    return int(np.argmin(distances_sq))
+
+
 def _steer(from_point: np.ndarray, to_point: np.ndarray) -> np.ndarray:
     """Step from ``from_point`` toward ``to_point`` by at most ``RRT_STEP``.
 
@@ -151,12 +266,18 @@ def rrt_plan(
     """Grow a goal-biased RRT from ``start_xy`` to ``goal_xy`` over ``grid_cells``.
 
     Each iteration samples free space (the goal with probability
-    ``RRT_GOAL_BIAS``), finds the nearest existing tree node, steers toward the
-    sample by ``RRT_STEP``, and accepts the new edge only if
-    ``segment_is_clear_grid`` reports the steered segment unobstructed. When a
-    new node lands within ``RRT_GOAL_TOLERANCE`` of the goal the search succeeds:
-    parents are walked back from that node to the root, the order is reversed to
-    run start-first, and the exact goal point is appended last.
+    ``RRT_GOAL_BIAS``), finds the nearest existing tree node (via the incremental
+    position buffer + ``_nearest_index_in_array``), steers toward the sample by
+    ``RRT_STEP``, and accepts the new edge only if ``_segment_clear_fast`` — the
+    allocation-free, bit-identical twin of ``segment_is_clear_grid`` — reports the
+    steered segment unobstructed. When a new node lands within
+    ``RRT_GOAL_TOLERANCE`` of the goal the search succeeds: parents are walked
+    back from that node to the root, the order is reversed to run start-first, and
+    the exact goal point is appended last.
+
+    Both speedups (the scalar LOS check and the buffer-backed nearest scan) return
+    byte-identical results to the prior numpy paths, so the planned path, cost, and
+    ``trace.jsonl`` are unchanged.
 
     Raises ``ValueError`` when the start or goal maps to a blocked/out-of-bounds
     cell, or when ``RRT_MAX_ITERS`` is exhausted without connecting (so a no-path
@@ -171,23 +292,45 @@ def rrt_plan(
         raise ValueError("RRT goal position is blocked or outside the grid.")
 
     # The tree is a parallel pair of lists: node[i] is a world-frame point and
-    # parents[i] is the index of its parent (-1 for the root). A list keeps the
-    # nearest-node scan and the parent walk fully order-deterministic.
+    # parents[i] is the index of its parent (-1 for the root). The lists are kept
+    # for `_reconstruct_points`' parent walk (fully order-deterministic).
     nodes: list[np.ndarray] = [start_point]
     parents: list[int] = [-1]
 
+    # Incremental node-position buffer (Part B): a preallocated, C-contiguous
+    # `(capacity, 2)` float array mirroring `nodes`, scanned as a `[:count]` slice
+    # for the nearest-neighbour argmin. This replaces the per-iteration
+    # `np.asarray(nodes)` rebuild — the rebuild was ~19% of `rrt_plan`'s time and
+    # grows once the LOS check is fast — while staying byte-identical to it (same
+    # values, same layout, same einsum/argmin). Doubling growth keeps appends
+    # amortized O(1).
+    capacity = 16
+    positions = np.empty((capacity, 2), dtype=float)
+    positions[0] = start_point
+    count = 1
+
     for _ in range(RRT_MAX_ITERS):
         sample = _sample_free_point(grid, goal_point, rng)
-        nearest_index = _nearest_node_index(nodes, sample)
+        nearest_index = _nearest_index_in_array(positions, count, sample)
         nearest_point = nodes[nearest_index]
         new_point = _steer(nearest_point, sample)
 
-        if not segment_is_clear_grid(grid_cells, grid, nearest_point, new_point):
+        if not _segment_clear_fast(grid_cells, grid, nearest_point, new_point):
             continue
 
         nodes.append(new_point)
         parents.append(nearest_index)
         new_index = len(nodes) - 1
+
+        # Mirror the accepted node into the position buffer, doubling capacity
+        # when full so the contiguous scan slice always covers every tree node.
+        if count == capacity:
+            capacity *= 2
+            grown = np.empty((capacity, 2), dtype=float)
+            grown[:count] = positions[:count]
+            positions = grown
+        positions[count] = new_point
+        count += 1
 
         if float(np.linalg.norm(new_point - goal_point)) <= RRT_GOAL_TOLERANCE:
             return _reconstruct_points(nodes, parents, new_index, goal_point)

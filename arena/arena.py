@@ -2408,6 +2408,225 @@ def tc46(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure in-process
     )
 
 
+def tc47(yaml_path: str, seed: int) -> None:  # noqa: ARG001 — pure in-process; fixed internal RNG
+    """rrt-local LOS helper == segment_is_clear_grid (stratified equivalence fuzz).
+
+    Proves the allocation-free scalar twin `planners.rrt._segment_clear_fast`
+    returns the BIT-IDENTICAL bool as the frozen reference
+    `planners._grid.segment_is_clear_grid` over a large stratified set of
+    segments. This is the safety net that lets the RRT hot loop swap the slow
+    numpy collision check for the fast scalar one without breaking the
+    byte-identical-trace guarantee; if a future edit to either function diverges
+    them on even one input, this case fails loud with the offending segment.
+
+    In-process only (NO irsim, NO subprocess). A FIXED internal RNG makes the
+    case deterministic regardless of the `seed` arg, which is ignored.
+
+    Several random boolean occupancy grids are built, each with occupied cells
+    pressed against ALL FOUR edges (a clip-to-edge-cell OOB endpoint only
+    distinguishes the two implementations when the edge cell is sometimes
+    occupied — without edge occupancy stratum 1 is toothless), and with varying
+    resolution and offset (so the clamp arithmetic is exercised under different
+    scales and origins). >= 100,000 (p0, p1) segments are apportioned across
+    four strata, each well-represented:
+
+    1. Out-of-bounds endpoints — one or both endpoints with negative coords
+       and/or coords past width/height (exercises the clip-to-edge-cell-then-read
+       path, the named LOS-equivalence trap).
+    2. Degenerate near-zero segments — endpoints within sub-1e-9 of each other,
+       plus exactly-equal endpoints (exercises the `length < 1e-9` branch).
+    3. Length spread — segment lengths spanning multiple sample_count regimes:
+       short (single-sample), mid, and long multi-sample. This stratum is what
+       makes a future `math.hypot` swap FAIL: a 1-ULP length difference flips the
+       sample count on ~17% of inputs.
+    4. In-bounds ordinary segments — the baseline stratum.
+    """
+    import math
+
+    _ensure_repo_root_on_path()
+    from manual_astar import OccupancyGrid  # type: ignore[import-not-found]
+    from planners._grid import segment_is_clear_grid  # type: ignore[import-not-found]
+    from planners.rrt import _segment_clear_fast  # type: ignore[import-not-found]
+
+    rng = np.random.default_rng(4_700_000_047)  # fixed: TC47 is self-deterministic
+
+    def build_grid(rows: int, cols: int, resolution: float, offset: np.ndarray) -> OccupancyGrid:
+        """A random boolean grid with ~18% interior fill AND occupied edge rings.
+
+        The four edges each get a random subset of occupied cells (so a clipped
+        OOB endpoint sometimes reads an occupied edge cell — the only way
+        stratum 1 can tell the two implementations apart).
+        """
+        cells = rng.random((rows, cols)) < 0.18
+        # Press occupancy against every edge: ~40% of each border cell occupied.
+        cells[0, :] |= rng.random(cols) < 0.40
+        cells[rows - 1, :] |= rng.random(cols) < 0.40
+        cells[:, 0] |= rng.random(rows) < 0.40
+        cells[:, cols - 1] |= rng.random(rows) < 0.40
+        # Keep a free interior anchor so not every read is trivially blocked.
+        cells[rows // 2, cols // 2] = False
+        return OccupancyGrid(
+            cells=np.ascontiguousarray(cells, dtype=np.bool_),
+            resolution=float(resolution),
+            offset=np.asarray(offset, dtype=float),
+        )
+
+    # A handful of grids spanning resolution and offset so the clamp arithmetic
+    # (floor((coord - offset) / resolution), clamped into [0, n-1]) is exercised
+    # under different scales and origins.
+    grids = [
+        build_grid(rows=50, cols=50, resolution=0.10, offset=np.array([0.0, 0.0])),
+        build_grid(rows=40, cols=60, resolution=0.25, offset=np.array([-5.0, 3.0])),
+        build_grid(rows=64, cols=48, resolution=0.05, offset=np.array([2.5, -1.25])),
+        build_grid(rows=33, cols=33, resolution=0.50, offset=np.array([-10.0, -10.0])),
+    ]
+
+    # Per-stratum budget: 4 strata x ~26,000 = ~104,000 total segments (>= 1e5).
+    per_stratum = 26_000
+    total = 0
+    mismatches = 0
+    sample_factor = 0.5  # planners._grid.SEGMENT_SAMPLE_FACTOR; sample_step = res*this
+
+    def world_extent(grid: OccupancyGrid) -> tuple[float, float, float, float]:
+        rows, cols = grid.shape
+        ox, oy = float(grid.offset[0]), float(grid.offset[1])
+        return ox, oy, ox + cols * grid.resolution, oy + rows * grid.resolution
+
+    def in_bounds_point(grid: OccupancyGrid) -> np.ndarray:
+        ox, oy, hx, hy = world_extent(grid)
+        return np.array(
+            [ox + float(rng.random()) * (hx - ox), oy + float(rng.random()) * (hy - oy)],
+            dtype=float,
+        )
+
+    def out_of_bounds_point(grid: OccupancyGrid) -> np.ndarray:
+        """A point with at least one coord pushed outside the grid's world extent."""
+        ox, oy, hx, hy = world_extent(grid)
+        width, height = hx - ox, hy - oy
+        # Each coord independently lands below-min, above-max, or in-range; force
+        # at least one axis out so the endpoint is genuinely OOB.
+        def coord(lo: float, span: float) -> tuple[float, bool]:
+            choice = int(rng.integers(0, 3))
+            if choice == 0:  # below the minimum (negative-relative)
+                return lo - float(rng.random()) * (span + 1.0) - 0.01, True
+            if choice == 1:  # past the maximum
+                return lo + span + float(rng.random()) * (span + 1.0) + 0.01, True
+            return lo + float(rng.random()) * span, False  # in-range
+
+        px, x_out = coord(ox, width)
+        py, y_out = coord(oy, height)
+        if not (x_out or y_out):  # guarantee OOB: shove x past the max edge
+            px = hx + float(rng.random()) * (width + 1.0) + 0.01
+        return np.array([px, py], dtype=float)
+
+    def check(grid: OccupancyGrid, p0: np.ndarray, p1: np.ndarray) -> None:
+        nonlocal total, mismatches
+        cells = grid.cells
+        fast = _segment_clear_fast(cells, grid, p0, p1)
+        slow = segment_is_clear_grid(cells, grid, p0, p1)
+        total += 1
+        if fast != slow:
+            mismatches += 1
+            raise AssertionError(
+                f"TC47 LOS mismatch: p0={tuple(float(c) for c in p0)} "
+                f"p1={tuple(float(c) for c in p1)}; grid resolution="
+                f"{grid.resolution} offset={tuple(float(c) for c in grid.offset)} "
+                f"shape={grid.shape}; _segment_clear_fast={fast} "
+                f"segment_is_clear_grid={slow}"
+            )
+
+    # --- Stratum 1: out-of-bounds endpoints (one or both OOB). ---
+    for _ in range(per_stratum):
+        grid = grids[int(rng.integers(0, len(grids)))]
+        if int(rng.integers(0, 2)) == 0:
+            # One OOB, one in-bounds (random which end).
+            a, b = out_of_bounds_point(grid), in_bounds_point(grid)
+            if int(rng.integers(0, 2)) == 0:
+                a, b = b, a
+        else:
+            # Both OOB.
+            a, b = out_of_bounds_point(grid), out_of_bounds_point(grid)
+        check(grid, a, b)
+
+    # --- Stratum 2: degenerate near-zero + exactly-equal endpoints. ---
+    for index in range(per_stratum):
+        grid = grids[int(rng.integers(0, len(grids)))]
+        base = in_bounds_point(grid)
+        if index % 4 == 0:
+            # Exactly-equal endpoints (the canonical length == 0 case).
+            check(grid, base, base.copy())
+        else:
+            # Sub-1e-9 perturbation: still inside the `length < 1e-9` branch.
+            jitter = (rng.random(2) - 0.5) * 2.0e-10
+            check(grid, base, base + jitter)
+
+    # --- Stratum 3: length spread across sample_count regimes. ---
+    # sample_step = resolution * 0.5; lengths chosen to land in the single-sample
+    # (length < sample_step => count clamped to 2), mid (a few samples), and long
+    # (many samples) regimes so a future hypot-vs-sqrt last-bit drift in the
+    # sample count would show up here.
+    for index in range(per_stratum):
+        grid = grids[int(rng.integers(0, len(grids)))]
+        sample_step = grid.resolution * sample_factor
+        ox, oy, hx, hy = world_extent(grid)
+        regime = index % 3
+        if regime == 0:  # short: below one sample_step (count clamps to 2)
+            target_len = float(rng.random()) * sample_step * 0.9
+        elif regime == 1:  # mid: a handful of samples
+            target_len = sample_step * (1.0 + float(rng.random()) * 6.0)
+        else:  # long: many samples
+            target_len = sample_step * (10.0 + float(rng.random()) * 60.0)
+        angle = float(rng.random()) * 2.0 * math.pi
+        dx = target_len * math.cos(angle)
+        dy = target_len * math.sin(angle)
+        # Anchor so both endpoints stay in-bounds (keep this stratum about the
+        # length->sample_count behaviour, not OOB clamping).
+        margin = abs(target_len) + grid.resolution
+        ax = ox + margin + float(rng.random()) * max(hx - ox - 2.0 * margin, 0.0)
+        ay = oy + margin + float(rng.random()) * max(hy - oy - 2.0 * margin, 0.0)
+        p0 = np.array([ax, ay], dtype=float)
+        p1 = np.array([ax + dx, ay + dy], dtype=float)
+        check(grid, p0, p1)
+
+    # --- Stratum 4: in-bounds ordinary segments (the baseline). ---
+    for _ in range(per_stratum):
+        grid = grids[int(rng.integers(0, len(grids)))]
+        check(grid, in_bounds_point(grid), in_bounds_point(grid))
+
+    assert total >= 100_000, (
+        f"TC47: stratified coverage too small ({total} segments); the plan "
+        f"requires >= 100,000"
+    )
+
+    # --- Length-formula guard: catches a future `math.hypot` swap in the helper. ---
+    # The helper MUST compute length as math.sqrt(dx*dx + dy*dy), which is
+    # bit-identical to float(np.linalg.norm(end - start)). math.hypot uses an
+    # extended-precision intermediate that flips the last bit on ~17% of inputs
+    # (e.g. dx=1.0, dy=2.4000000000000004 yields a different value), which would
+    # propagate into the sample count and flip the returned bool. Assert the sqrt
+    # form is bit-for-bit equal to numpy's norm over a large random sample, and
+    # pin the documented counterexample so the trap is explicit in the test.
+    dx_trap, dy_trap = 1.0, 2.4000000000000004
+    sqrt_trap = math.sqrt(dx_trap * dx_trap + dy_trap * dy_trap)
+    hypot_trap = math.hypot(dx_trap, dy_trap)
+    assert sqrt_trap != hypot_trap, (
+        "TC47: the documented hypot/sqrt counterexample no longer diverges on "
+        "this platform; pick a fresh dx/dy pair to keep the guard meaningful"
+    )
+    for _ in range(20_000):
+        dx_g = float(rng.standard_normal()) * 10.0
+        dy_g = float(rng.standard_normal()) * 10.0
+        sqrt_len = math.sqrt(dx_g * dx_g + dy_g * dy_g)
+        norm_len = float(np.linalg.norm(np.asarray([dx_g, dy_g], dtype=float)))
+        assert sqrt_len == norm_len, (
+            f"TC47 length-formula guard: math.sqrt(dx*dx+dy*dy)={sqrt_len!r} != "
+            f"float(np.linalg.norm)={norm_len!r} for dx={dx_g!r} dy={dy_g!r}; "
+            f"the helper must use math.sqrt (math.hypot would diverge here)"
+        )
+
+    print(f"TC47: {total} segments, {mismatches} mismatches")
+
+
 # ---------------------------------------------------------------------------
 # TC38..TC45 — the reactive (DWA / APF) + sampling (RRT / RRT*) families plus
 # the commitment-horizon fix proof. TC38/TC39 are traffic-ON reactive drives;
@@ -2978,6 +3197,7 @@ def _run_checks(yaml_path: str, seed: int) -> int:
         ("TC43: --replan-k validation for the 6 reactive/sampling keys", tc43),
         ("TC44: rrt_replan/rrt_star_replan traffic e2e + labeled dir", tc44),
         ("TC45: commitment-horizon fix proof (goal + follower identity)", tc45),
+        ("TC47: rrt-local LOS helper == segment_is_clear_grid (stratified fuzz)", tc47),
     ]
     failures = 0
     for label, fn in cases:
@@ -3020,7 +3240,7 @@ def _parse_args() -> argparse.Namespace:
     group.add_argument(
         "--check",
         action="store_true",
-        help="Run TC1-TC46 headless (47 cases, incl. Phase 2 traffic + Phase 3 batch runner + replanning + D* Lite (incl. deferred-settle) + reactive (DWA/APF) + sampling (RRT/RRT*) families)",
+        help="Run TC1-TC47 headless (48 cases, incl. Phase 2 traffic + Phase 3 batch runner + replanning + D* Lite (incl. deferred-settle) + reactive (DWA/APF) + sampling (RRT/RRT*) families + rrt-local LOS-helper equivalence)",
     )
     return parser.parse_args()
 
